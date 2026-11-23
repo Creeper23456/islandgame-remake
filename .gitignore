@@ -1,0 +1,13 @@
+*.zip
+*.sis
+*.sisx
+*.exe
+*.dll
+*.rom
+*.AppImage
+**/SIMLIFE/
+/build/
+/work/
+/saves/
+__pycache__/
+*.log
