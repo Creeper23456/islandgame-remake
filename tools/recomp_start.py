@@ -390,6 +390,9 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             dll, ordinal = module.imports[pc + 4]
             if (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1360):
                 ops = ['r[0] = setup_thread_heap(stack, r[1]);', 'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('mediaclientaudiostream{000a0000}[10003996].dll', 3):
+                ops = ['r[0] = audio_new(stack, r[0], r[1]);',
+                       'if (!r[0]) return unhandled_leave((uint32_t)-4, r[14]);', 'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('drtaeabi{000a0000}.dll', 135):
                 ops = ['if (!aeabi_idivmod(r)) return unsupported(r[14], 0);', 'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) in (('drtaeabi{000a0000}.dll', 139), ('drtaeabi{000a0000}.dll', 155)):
@@ -528,6 +531,27 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                        'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 2060):
                 ops = ['r[0] = cleanup_mark();', 'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 196):
+                ops = ['r[0] = trap_cleanup_new(stack);', 'target = r[14]; goto dispatch;']
+            elif app_profile and dll.lower() == 'euser{000a0000}[100039e5].dll' and ordinal in (425, 426, 428, 430, 433):
+                if ordinal == 430:  # CActiveScheduler::CActiveScheduler()
+                    ops = ['if (!worker_scheduler_construct(stack, r[0])) return unsupported(r[14], 0);']
+                elif ordinal == 428:
+                    ops = ['if (!worker_scheduler_install(stack, r[0])) return unsupported(r[14], 0);']
+                elif ordinal == 426:
+                    ops = ['if (!is_guest_thread(ctx) || !ctx->scheduler) return unsupported(r[14], 0);',
+                           'ctx->scheduler_running = 1;',
+                           'target = WORKER_SCHEDULER_STEP; goto dispatch;']
+                elif ordinal == 425:
+                    ops = ['if (!current_worker || !current_worker->scheduler_running) return unsupported(r[14], 0);',
+                           'current_worker->scheduler_running = 0;']
+                else:
+                    ops = ['if (!worker_scheduler_destroy(stack, r[0])) return unsupported(r[14], 0);']
+                if ordinal != 426:
+                    ops += ['target = r[14]; goto dispatch;']
+            elif app_profile and dll.lower() == 'euser{000a0000}[100039e5].dll' and ordinal in (199, 200, 201):
+                ops = ['if (!trap_cleanup_destroy(stack, r[0])) return unsupported(r[14], 0);',
+                       'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 2061):
                 ops = ['cleanup_unmark(r[0]);', 'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) in (('euser{000a0000}[100039e5].dll', 651), ('euser{000a0000}[100039e5].dll', 654)):
@@ -716,11 +740,16 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1795):
                 ops = ['(void)thread_resume(stack, guest_read(stack, r[0]));',
                        'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1790):
+                ops = ['if (!thread_request_complete(stack, guest_read(stack, r[0]), r[1], r[2]))',
+                       '    return unsupported(r[14], 0);', 'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1154):
                 ops = ['r[0] = (uint32_t)thread_kill(stack, guest_read(stack, r[0]));',
                        'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 120):
-                ops = ['(void)thread_close(stack, guest_read(stack, r[0]));',
+                ops = ['{ const uint32_t handle = guest_read(stack, r[0]);',
+                       '  if (handle == ETEL_EMPTY_SESSION || sem_close(handle) || thread_close(stack, handle) == 0)',
+                       '      guest_write(stack, r[0], 0); }',
                        'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 64):
                 # RSemaphore::CreateLocal(TInt, TOwnerType): r0=this, r1=count.
@@ -734,21 +763,16 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                 # RSemaphore::Signal(): r0=this.
                 ops = ['(void)sem_signal(guest_read(stack, r[0]), 1);',
                        'target = r[14]; goto dispatch;']
-            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 68):
-                # RSemaphore::Wait(TInt): r0=this, r1=count.
-                ops = ['r[0] = (uint32_t)sem_wait(guest_read(stack, r[0]), (int32_t)r[1]);',
-                       'target = r[14]; goto dispatch;']
-            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 69):
-                # RSemaphore::Wait(): r0=this.
-                ops = ['r[0] = (uint32_t)sem_wait(guest_read(stack, r[0]), 1);',
+            elif app_profile and dll.lower() == 'euser{000a0000}[100039e5].dll' and ordinal in (69, 922):
+                indirect_targets.add(pc)
+                ops = ['{ int status = sem_wait(stack, ctx, guest_read(stack, r[0]), 1);',
+                       f'   if (status == THREAD_YIELD) {{ target = {pc:#x}; return status; }}',
+                       f'   if (status == SEM_BAD_WAIT) return missing_import({pc:#x}, {json.dumps(dll)}, {ordinal}, r);',
+                       '   if (status) return status; }',
                        'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 918):
                 # RMutex::CreateLocal(TOwnerType): r0=this.
                 ops = ['r[0] = (uint32_t)mutex_create_local(stack, r[0]);',
-                       'target = r[14]; goto dispatch;']
-            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 922):
-                # RMutex::Wait(): r0=this.
-                ops = ['r[0] = (uint32_t)sem_wait(guest_read(stack, r[0]), 1);',
                        'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 923):
                 # RMutex::Signal(): r0=this.
@@ -824,6 +848,18 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                 # CActiveSchedulerWait::AsyncStop(): clears iLoop (+4) so the owning Start() returns.
                 ops = ['guest_write(stack, r[0] + 4, 0);',
                        'target = r[14]; goto dispatch;']
+            elif app_profile and dll.lower() == 'etel{000a0000}[10003d46].dll' and ordinal in (29, 30, 167):
+                # RTelServer is an RSessionBase. This host has an empty inventory, not an emulated handset.
+                if ordinal == 30:  # RTelServer::RTelServer()
+                    ops = ['guest_write(stack, r[0], 0);']
+                elif ordinal == 29:  # RTelServer::Connect(TInt)
+                    ops = ['if ((int32_t)r[1] < -1) r[0] = (uint32_t)-6;',
+                           'else if (guest_read(stack, r[0])) r[0] = (uint32_t)-11;',
+                           'else { guest_write(stack, r[0], ETEL_EMPTY_SESSION); r[0] = 0; }']
+                else:  # RTelServer::EnumeratePhones(TInt&)
+                    ops = ['if (guest_read(stack, r[0]) != ETEL_EMPTY_SESSION) r[0] = (uint32_t)-8;',
+                           'else { guest_write(stack, r[1], 0); r[0] = 0; }']
+                ops += ['target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('etel3rdparty{000a0000}[10004268].dll', 53):
                 # CTelephony::NewL(): this PC host has no cellular modem. The object exists with a
                 # null iTelephonyFunctions (CBase vptr + one pointer). Its methods must report
@@ -1230,7 +1266,33 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                  for pc in sorted((factory_targets | lifecycle_targets | dll_targets | thread_targets
                                    | indirect_targets | {entry}) - call_returns))
     if calls_factory and app_profile:
-        lines += ['    case SCREEN_DISPLAY_MODE:',
+        lines += ['    case AUDIO_BASE + 4: case AUDIO_BASE + 0x10: case AUDIO_BASE + 0x14:',
+                  '    case AUDIO_BASE + 0x18: case AUDIO_BASE + 0x1c: case AUDIO_BASE + 0x24: case AUDIO_BASE + 0x28:',
+                  '        if (r[0] != audio.object || current_worker != audio.owner) return unsupported(r[14], target);',
+                  '        switch (target - AUDIO_BASE) {',
+                  '        case 4: audio_destroy(); break;',
+                  '        case 0x10: audio_open(stack, r[1]); break;',
+                  '        case 0x14: r[0] = SDL_MIX_MAXVOLUME; break;',
+                  '        case 0x18: r[0] = (uint32_t)audio.volume; break;',
+                  '        case 0x1c: audio_set_volume((int32_t)r[1]); break;',
+                  '        case 0x24: { int error = audio_write(stack, r[1]);',
+                  '                     if (error) return unhandled_leave((uint32_t)error, r[14]); break; }',
+                  '        case 0x28: if (!audio_stop(stack, r[13])) return 3; break;',
+                  '        }',
+                  '        target = r[14]; goto dispatch;',
+                  '    case WORKER_SCHEDULER_STEP:',
+                  '        if (ctx->scheduler_running) {',
+                  '            if (!worker_scheduler_step(stack, ctx)) return 3;',
+                  '            if (ctx->scheduler_running) return THREAD_YIELD;',
+                  '        }',
+                  '        target = r[14]; goto dispatch;',
+                  '    case WORKER_SCHEDULER_DESTROY:',
+                  '        if (!worker_scheduler_destroy(stack, r[0])) return unsupported(r[14], 0);',
+                  '        target = r[14]; goto dispatch;',
+                  '    case TRAP_CLEANUP_DESTROY:',
+                  '        if (!trap_cleanup_destroy(stack, r[0])) return unsupported(r[14], 0);',
+                  '        target = r[14]; goto dispatch;',
+                  '    case SCREEN_DISPLAY_MODE:',
                   '        if (r[0] != framework.screen_device) return 3;',
                   '        r[0] = DISPLAY_RGB565; target = r[14]; goto dispatch;',
                   '    case SCREEN_NEAREST_FONT:',
@@ -1275,7 +1337,7 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                   '        fprintf(stderr, "AppUi constructed; foreground callback at 0x%08x\\n", target);',
                   '        r[14] = 0xff000030; goto dispatch;',
                   '    case 0xff000030:',
-                  '        threads_run_ready(stack);',
+                  '        { int status = threads_run_ready(stack); if (status) return status; }',
                   '        if (!next_timer_event(stack, &r[0], &target)) return 3;',
                   '        r[14] = 0xff000030; goto dispatch;']
     elif calls_factory:
@@ -1663,11 +1725,15 @@ static unsigned capture_count;
 #define DEVICE_BASE UINT32_C(0xff004000)
 #define BITGC_BASE UINT32_C(0xff005000)
 #define TELEPHONY_BASE UINT32_C(0xff006000)
+#define TRAP_CLEANUP_DESTROY UINT32_C(0xff009000)
+#define WORKER_SCHEDULER_STEP UINT32_C(0xff009004)
+#define WORKER_SCHEDULER_DESTROY UINT32_C(0xff009008)
 {(Path(__file__).with_name('window_gc.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('fbs_bitmap.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('game_files.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('guest_threads.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('guest_sync.h').read_text() if app_profile else '')}
+{(Path(__file__).with_name('guest_audio.h').read_text() if app_profile else '')}
 
 #if {int(bool(app_profile))}
 static int window_gc(uint32_t *stack, uint32_t slot, uint32_t context, uint32_t arg, uint32_t point, uint32_t pc) {{
@@ -1714,12 +1780,39 @@ static int window_gc(uint32_t *stack, uint32_t slot, uint32_t context, uint32_t 
 }}
 #endif
 enum {{ DISPLAY_RGB565 = 7 }}; /* EColor64K */
+#define ETEL_EMPTY_SESSION UINT32_C(0x0000e7e1)
 enum {{ font_spec_size = 72, font_spec_height = 56 }};
 /* CleanupStack entries: a CBase* (destroyed through its deleting destructor), a TAny* (User::Free), a
    TCleanupItem (operation called with the pointer), or an RReadStream (CleanupReleasePushL: Release()). */
 enum {{ CLEANUP_CBASE, CLEANUP_ANY, CLEANUP_ITEM, CLEANUP_READ_STREAM }};
-static struct {{ uint32_t pointer, operation, kind; }} cleanup_items[64];
-static unsigned cleanup_depth;
+static struct guest_cleanup main_cleanup;
+#define cleanup_items ((current_worker ? &current_worker->cleanup : &main_cleanup)->items)
+#define cleanup_depth ((current_worker ? &current_worker->cleanup : &main_cleanup)->depth)
+#define cleanup_handler ((current_worker ? &current_worker->cleanup : &main_cleanup)->handler)
+
+/* The translated TRAP sites track cleanup depth directly rather than invoking a guest TTrapHandler. */
+static uint32_t trap_cleanup_new(uint32_t *stack) {{
+    static uint32_t vtable;
+    if (!vtable) {{
+        vtable = heap_try_alloc(8);
+        if (!vtable) return 0;
+        guest_write(stack, vtable, TRAP_CLEANUP_DESTROY);
+        guest_write(stack, vtable + 4, TRAP_CLEANUP_DESTROY);
+    }}
+    uint32_t object = heap_try_alloc(12);
+    if (!object) return 0;
+    guest_write(stack, object, vtable);
+    guest_write(stack, object + 4, cleanup_handler);
+    guest_write(stack, object + 8, cleanup_depth);
+    cleanup_handler = object;
+    return object;
+}}
+
+static int trap_cleanup_destroy(uint32_t *stack, uint32_t object) {{
+    if (!object || object != cleanup_handler || guest_read(stack, object + 8) != cleanup_depth) return 0;
+    cleanup_handler = guest_read(stack, object + 4);
+    return 1;
+}}
 
 static void start_application(void) {{
     if (framework.coe_env) {{
@@ -1994,17 +2087,19 @@ static int base_construct_appui(uint32_t *stack, uint32_t appui, uint32_t flags)
 }}
 
 static int add_active(uint32_t *stack, uint32_t object) {{
-    if (!framework.control_stack || !object || guest_read(stack, object + 12)) {{
+    uint32_t *queue = current_worker ? &current_worker->active_queue : &framework.active_queue;
+    if ((current_worker ? !current_worker->scheduler : !framework.control_stack) ||
+        !object || guest_read(stack, object + 12)) {{
         fputs("invalid CActiveScheduler::Add\\n", stderr);
         return 0;
     }}
-    if (!framework.active_queue) {{
-        framework.active_queue = heap_alloc_zeroed(8);
-        guest_write(stack, framework.active_queue, framework.active_queue);
-        guest_write(stack, framework.active_queue + 4, framework.active_queue);
+    if (!*queue) {{
+        *queue = heap_alloc_zeroed(8);
+        guest_write(stack, *queue, *queue);
+        guest_write(stack, *queue + 4, *queue);
     }}
     /* TRequestStatus at +4 (status and flags); TPriQueLink at +12. */
-    uint32_t link = object + 12, head = framework.active_queue;
+    uint32_t link = object + 12, head = *queue;
     uint32_t next = guest_read(stack, head);
     uint32_t priority = guest_read(stack, link + 8) ^ 0x80000000u;
     while (next != head && (guest_read(stack, next + 8) ^ 0x80000000u) >= priority)
@@ -2162,6 +2257,50 @@ static int remove_active(uint32_t *stack, uint32_t object) {{
     guest_write(stack, next + 4, prev);
     guest_write(stack, link, 0);
     guest_write(stack, link + 4, 0);
+    return 1;
+}}
+
+static int worker_scheduler_construct(uint32_t *stack, uint32_t object) {{
+    static uint32_t vtable;
+    if (!current_worker || !object) return 0;
+    if (!vtable) {{
+        vtable = heap_try_alloc(8);
+        if (!vtable) return 0;
+        guest_write(stack, vtable, WORKER_SCHEDULER_DESTROY);
+        guest_write(stack, vtable + 4, WORKER_SCHEDULER_DESTROY);
+    }}
+    guest_write(stack, object, vtable);
+    return 1;
+}}
+
+static int worker_scheduler_install(uint32_t *stack, uint32_t object) {{
+    if (!current_worker || current_worker->scheduler_running || (object && current_worker->scheduler)) return 0;
+    (void)stack;
+    current_worker->scheduler = object;
+    return 1;
+}}
+
+static int worker_scheduler_destroy(uint32_t *stack, uint32_t object) {{
+    if (!current_worker || !object || current_worker->scheduler_running ||
+        (current_worker->scheduler && current_worker->scheduler != object)) return 0;
+    uint32_t head = current_worker->active_queue;
+    while (head && guest_read(stack, head) != head)
+        if (!remove_active(stack, guest_read(stack, head) - 12)) return 0;
+    current_worker->scheduler = current_worker->active_queue = 0;
+    return 1;
+}}
+
+static int worker_scheduler_step(uint32_t *stack, struct guest_thread *ctx) {{
+    complete_deferred(stack);
+    if (!audio_dispatch(stack, ctx)) return 0;
+    uint32_t head = ctx->active_queue;
+    if (!head) return 1;
+    for (uint32_t link = guest_read(stack, head); link != head; link = guest_read(stack, link)) {{
+        uint32_t object = link - 12, flags = guest_read(stack, object + 8);
+        if ((flags & 3) != 1 || guest_read(stack, object + 4) == UINT32_C(0x80000001)) continue;
+        guest_write(stack, object + 8, flags & ~1u);
+        return run_nested_event(stack, guest_read(stack, guest_read(stack, object) + 16), object, ctx->r[13]);
+    }}
     return 1;
 }}
 
@@ -2392,7 +2531,9 @@ int main(int argc, char **argv) {{
     info[14] = {image.heap_max};
 #if {int(bool(app_profile))}
     (void)resource_root;
-    return guest_run(&main_thread, stack);
+    int status = guest_run(&main_thread, stack);
+    audio_destroy();
+    return status;
 #else
     int z = 0, c = 0, n = 0, v = 0;
     uint32_t a = 0, b = 0, result = 0;
