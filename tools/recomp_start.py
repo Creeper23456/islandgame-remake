@@ -127,6 +127,7 @@ EUSER_DESCRIPTOR_OPS = {
     595: 'r[0] = guest_strlen(stack, r[0]);',  # User::StringLength(const TUint8*)
     743: f'if (!desc_store(stack, r[0], 1, r[1], 1, r[2], 0)) {_FAIL}',  # TDes8::Copy(const TUint8*, TInt)
     744: f'if (!desc_store_desc(stack, r[0], 1, r[1], 1, 0)) {_FAIL}',  # TDes8::Copy(const TDesC8&)
+    745: f'if (!desc_store_desc(stack, r[0], 1, r[1], 2, 0)) {_FAIL}',  # TDes8::Copy(const TDesC16&): low byte of each unit
     752: f'if (!desc_set_length(stack, r[0], 0)) {_FAIL}',  # TDes8::Zero()
     759: f'if (!desc_store(stack, r[0], 1, r[1], 1, r[2], 1)) {_FAIL}',  # TDes8::Append(const TUint8*, TInt)
     760: f'if (!desc_store_desc(stack, r[0], 1, r[1], 1, 1)) {_FAIL}',  # TDes8::Append(const TDesC8&)
@@ -135,17 +136,25 @@ EUSER_DESCRIPTOR_OPS = {
           ' guest_write(stack, r[0] + 8, r[1]);'),  # TPtr8::TPtr8(TUint8*, TInt, TInt) (C1)
     951: f'if (!desc_store(stack, r[0], 2, r[1], 2, r[2], 0)) {_FAIL}',  # TDes16::Copy(const TUint16*, TInt)
     952: f'if (!desc_store_desc(stack, r[0], 2, r[1], 1, 0)) {_FAIL}',  # TDes16::Copy(const TDesC8&) widens
+    953: f'if (!desc_store_desc(stack, r[0], 2, r[1], 2, 0)) {_FAIL}',  # TDes16::Copy(const TDesC16&)
     # TDes16::Append(TChar): one BMP character (the 16-bit build stores UTF-16 units).
     966: ('{ uint32_t length, text = text_data(stack, r[0], &length);'
           ' if (r[1] > 0xffff || !text || length >= guest_read(stack, r[0] + 4) || !desc_set_length(stack, r[0], length + 1)) '
           + _FAIL + ' guest_write_small(stack, text + 2 * length, r[1], 2); }'),
     967: f'if (!desc_store(stack, r[0], 2, r[1], 2, r[2], 1)) {_FAIL}',  # TDes16::Append(const TUint16*, TInt)
+    968: f'if (!desc_store_desc(stack, r[0], 2, r[1], 2, 1)) {_FAIL}',  # TDes16::Append(const TDesC16&)
+    767: f'if (!desc_format_int(stack, r[0], r[1], 1, (int32_t)r[2])) {_FAIL}',  # TDes8::Format: script commands
+    973: f'if (!desc_format_int(stack, r[0], r[1], 2, (int32_t)r[2])) {_FAIL}',  # TDes16::Format: numbered paths
     988: f'if (!desc_set_length(stack, r[0], r[1])) {_FAIL}',  # TDes16::SetLength(TInt)
     1032: 'guest_write(stack, r[0], UINT32_C(0x10000000) | guest_strlen(stack, r[1])); guest_write(stack, r[0] + 4, r[1]);',
     1033: 'guest_write(stack, r[0], UINT32_C(0x10000000) | (r[2] & 0xfffffff)); guest_write(stack, r[0] + 4, r[1]);',
     1034: ('{ uint32_t length, text = text_data(stack, r[1], &length); if (!text) ' + _FAIL +
            ' guest_write(stack, r[0], UINT32_C(0x10000000) | length); guest_write(stack, r[0] + 4, text); }'),
     1035: 'guest_write(stack, r[0], UINT32_C(0x10000000)); guest_write(stack, r[0] + 4, 0);',  # TPtrC8::TPtrC8()
+    1116: f'if (!hbufc16_des(stack, r[0], r[1])) {_FAIL}',  # HBufC16::Des(), hidden result pointer in r0
+    1118: ('if (r[0] > 0x0fffffffu) ' + _FAIL +
+           ' r[0] = heap_try_alloc(4 + 2 * r[0]); if (!r[0]) return unhandled_leave((uint32_t)-4, r[14]);'),
+    1169: f'if (!tptrc16_from_z(stack, r[0], r[1])) {_FAIL}',  # TPtrC16(const TUint16*)
     1170: 'guest_write(stack, r[0], UINT32_C(0x10000000) | (r[2] & 0xfffffff)); guest_write(stack, r[0] + 4, r[1]);',
     1719: f'{{ uint32_t length; r[0] = text_data(stack, r[0], &length); if (!r[0]) {_FAIL} }}',  # TDesC8::Ptr()
     1806: ('{ uint32_t length, text = text_data(stack, r[0], &length); if (!text || r[1] >= length) ' + _FAIL +
@@ -202,7 +211,7 @@ EUSER_DESCRIPTOR_OPS = {
 ESTLIB_OPS = {
     108: 'r[0] = (int32_t)r[0] < 0 ? 0u - r[0] : r[0];',  # abs
     113: 'r[0] = guest_atoi(stack, r[0]);',  # atoi
-    145: '',  # free: the guest heap does not reuse memory
+    145: 'if (!heap_release(r[0])) return unsupported(r[14], 0);',  # free
     198: 'r[0] = heap_try_alloc(r[0]);',  # malloc: NULL when the heap is exhausted
     203: 'r[0] = guest_memcmp(stack, r[0], r[1], r[2]);',  # memcmp
     245: 'r[0] = guest_strcat(stack, r[0], r[1]);',  # strcat
@@ -404,9 +413,14 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                 ops = ['r[0] = heap_try_alloc(r[0]);', 'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) in (('scppnwdl{000a0000}.dll', 1), ('scppnwdl{000a0000}.dll', 3)):
                 ops = ['if (!heap_release(r[0])) return unsupported(r[14], 0);', 'target = r[14]; goto dispatch;']
-            elif app_profile and (dll.lower(), ordinal) in (('fbscli{000a0000}[10003a15].dll', 25),
-                                                             ('fbscli{000a0000}[10003a15].dll', 31)):
-                ops = ['fbs_bitmap_reset(r[0]);', 'target = r[14]; goto dispatch;']
+            elif app_profile and dll.lower() == 'fbscli{000a0000}[10003a15].dll' and ordinal in (31, 32):
+                ops = ['if (!fbs_bitmap_construct(stack, r[0])) return unsupported(r[14], 0);',
+                       'target = r[14]; goto dispatch;']
+            elif app_profile and dll.lower() == 'fbscli{000a0000}[10003a15].dll' and ordinal in (25, 33, 34, 35):
+                ops = ['if (!fbs_bitmap_reset(r[0])) return unsupported(r[14], 0);']
+                if ordinal == 33:
+                    ops.append('if (!heap_release(r[0])) return unsupported(r[14], 0);')
+                ops.append('target = r[14]; goto dispatch;')
             elif app_profile and (dll.lower(), ordinal) == ('bitgdi{000a0000}[10003b18].dll', 44):
                 ops = ['if (!fbs_device_new(stack, r[0], &r[0])) return 3;', 'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('bitgdi{000a0000}[10003b18].dll', 57):
@@ -420,6 +434,9 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                 ops = ['if (!fbs_data_address(r[0], &r[0])) return unsupported(r[14], 0);', 'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('fbscli{000a0000}[10003a15].dll', 117):
                 ops = ['if (!fbs_size_in_pixels(stack, r[0], r[1])) return unsupported(r[14], 0);', 'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('fbscli{000a0000}[10003a15].dll', 14):
+                ops = [f'if (!fbs_scanline(r[0], r[1], &r[0])) return missing_import({pc:#x}, {json.dumps(dll)}, {ordinal}, r);',
+                       'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('fbscli{000a0000}[10003a15].dll', 107):
                 ops = ['if (!fbs_unlock_heap(r[0])) return unsupported(r[14], 0);', 'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 842):
@@ -433,6 +450,12 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                        'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('efsrv{000a0000}[100039e4].dll', 300):
                 ops = ['rfile_close(stack, r[0]);', 'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('efsrv{000a0000}[100039e4].dll', 96):
+                ops = ['r[0] = (uint32_t)rfile_flush(stack, r[0]);', 'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('efsrv{000a0000}[100039e4].dll', 99):
+                ops = ['r[0] = (uint32_t)rfile_write(stack, r[0], r[1], r[2]);', 'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('efsrv{000a0000}[100039e4].dll', 109):
+                ops = ['r[0] = (uint32_t)rfile_set_size(stack, r[0], (int32_t)r[1]);', 'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) in (('efsrv{000a0000}[100039e4].dll', 255),
                                                             ('efsrv{000a0000}[100039e4].dll', 257)):
                 # RFile::Read(TDes8&) / Read(TDes8&, TInt) const.
@@ -561,8 +584,21 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 593):
                 ops = ['if (r[0] & 0x80000000u) return unhandled_leave(r[0], r[14]);',
                        'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 548):
+                # Math::Rand(TInt64&): SDK um_rand.cpp, with 64-bit wraparound.
+                ops = ['{ const uint64_t seed = guest_read64(stack, r[0]) * 214013u + 2531011u;',
+                       '  guest_write64(stack, r[0], seed); r[0] = (seed >> 16) & 0x7fffffffu; }',
+                       'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 649):
+                ops = ['return unhandled_leave(r[0], r[14]);']
+            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 665):
+                ops = ['r[0] = user_allocator(stack);',
+                       'if (!r[0]) return unhandled_leave((uint32_t)-4, r[14]);', 'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 859):
                 ops = ['if (!home_time(stack, r[0])) return 3;', 'target = r[14]; goto dispatch;']
+            elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 914):
+                ops = [f'if (!debug_print(stack, r)) return missing_import({pc:#x}, {json.dumps(dll)}, {ordinal}, r);',
+                       'r[0] = 0; target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1677):
                 ops = ['guest_write64(stack, r[0], guest_read64(stack, r[1]) - ((uint64_t)r[3] << 32 | r[2]));',
                        'target = r[14]; goto dispatch;']
@@ -1205,7 +1241,7 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                   '        r[0] = 0; target = r[14]; goto dispatch;',
                   '    case GC_BASE + 0x24: case GC_BASE + 0x3c: case GC_BASE + 0x40:',
                   '    case GC_BASE + 0x48: case GC_BASE + 0x4c: case GC_BASE + 0x88: case GC_BASE + 0xac:',
-                  '    case GC_BASE + 0x110: case GC_BASE + 0x114:',
+                  '    case GC_BASE + 0xe4: case GC_BASE + 0x110: case GC_BASE + 0x114:',
                   '        if (!window_gc(stack, target - GC_BASE, r[0], r[1], r[2], r[14] - 4)) return 3;',
                   '        target = r[14]; goto dispatch;',
                   f'    case {0x80000000 | (control_vtable + 0x20):#x}:',
@@ -1254,6 +1290,14 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
     if app_profile:
         # A guest thread that returns reaches GUEST_THREAD_SENTINEL in r14.
         lines += ['    case 0xff00ff00:', '        return 0;']
+        lines += [f'    case ALLOCATOR_BASE + {slot:#x}:' for slot in range(0, 0x28, 4)]
+        lines += ['        if (target != ALLOCATOR_BASE + 0x18 || r[0] != allocator_object)',
+                  '            return trap_slot("RAllocator", target - ALLOCATOR_BASE, r[0]);',
+                  '        r[0] = heap_alloc_size(stack, r[1]); target = r[14]; goto dispatch;']
+        lines += ['    case FBS_BITMAP_BASE: case FBS_BITMAP_BASE + 4:',
+                  '        if (!fbs_bitmap_reset(r[0]) || (target == FBS_BITMAP_BASE + 4 && !heap_release(r[0])))',
+                  '            return trap_slot("CFbsBitmap", target - FBS_BITMAP_BASE, r[0]);',
+                  '        target = r[14]; goto dispatch;']
     # Trap vtables for objects whose methods are not implemented yet; each call is reported by class, slot and receiver.
     lines += [f'    case DEVICE_BASE + {slot:#x}:' for slot in range(0, 0xa0, 4)]
     lines += ['        return trap_slot("CFbsBitmapDevice", target - DEVICE_BASE, r[0]);']
@@ -1355,6 +1399,7 @@ static uint32_t lookup_export(const uint32_t *stack, uint32_t object, uint32_t o
     return f'''/* Local build output; do not distribute. */
 #define _GNU_SOURCE
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1362,7 +1407,7 @@ static uint32_t lookup_export(const uint32_t *stack, uint32_t object, uint32_t o
 #include <errno.h>
 
 enum {{ stack_base = 0x100000, stack_size = {stack_size}, thread_info_size = 64, heap_base = 0x20000000 }};
-static struct {{ unsigned char *backing; uint32_t committed, limit, used; }} thread_heap;
+static struct {{ unsigned char *backing; uint32_t committed, limit, used, free_head; }} thread_heap;
 {image_arrays}
 
 static uint32_t stack_index(uint32_t address) {{
@@ -1473,16 +1518,42 @@ static uint32_t setup_thread_heap(const uint32_t *stack, uint32_t info) {{
     if (!thread_heap.backing) return UINT32_C(0xfffffffc); /* KErrNoMemory */
     thread_heap.committed = initial;
     thread_heap.limit = limit;
+    thread_heap.free_head = UINT32_MAX;
     return 0;
+}}
+
+/* Each aligned block starts with its total size and the next free offset (or its live marker). */
+#define HEAP_LIVE (UINT32_MAX - 1)
+static uint32_t *heap_block(uint32_t offset) {{
+    return (uint32_t *)(thread_heap.backing + offset);
 }}
 
 /* Returns 0 when the heap cannot satisfy the request (User::Alloc / operator new[] semantics). */
 static uint32_t heap_try_alloc(uint32_t size) {{
     if (!size) size = 1; /* zero-size allocations still need a distinct address */
     if (!thread_heap.backing || size > thread_heap.limit || thread_heap.limit > UINT32_MAX - heap_base ||
-        size > UINT32_MAX - 7 || ((size + 7) & ~UINT32_C(7)) > thread_heap.limit - thread_heap.used) return 0;
+        size > UINT32_MAX - 15) return 0;
+    uint32_t length = ((size + 7) & ~UINT32_C(7)) + 8;
+    uint32_t *link = &thread_heap.free_head;
+    while (*link != UINT32_MAX) {{
+        uint32_t start = *link, *block = heap_block(start);
+        if (block[0] >= length) {{
+            if (block[0] - length >= 16) {{
+                uint32_t *rest = heap_block(start + length);
+                rest[0] = block[0] - length;
+                rest[1] = block[1];
+                *link = start + length;
+                block[0] = length;
+            }} else *link = block[1];
+            block[1] = HEAP_LIVE;
+            memset(block + 2, 0, size);
+            return heap_base + start + 8;
+        }}
+        link = &block[1];
+    }}
+    if (length > thread_heap.limit - thread_heap.used) return 0;
     uint32_t start = thread_heap.used;
-    uint32_t end = start + ((size + 7) & ~UINT32_C(7));
+    uint32_t end = start + length;
     if (end > thread_heap.committed) {{
         unsigned char *grown = realloc(thread_heap.backing, end);
         if (!grown) {{
@@ -1492,9 +1563,12 @@ static uint32_t heap_try_alloc(uint32_t size) {{
         thread_heap.backing = grown;
         thread_heap.committed = end;
     }}
-    memset(thread_heap.backing + start, 0, size);
+    uint32_t *block = heap_block(start);
+    block[0] = length;
+    block[1] = HEAP_LIVE;
+    memset(block + 2, 0, size);
     thread_heap.used = end;
-    return heap_base + start;
+    return heap_base + start + 8;
 }}
 
 static uint32_t heap_alloc_zeroed(uint32_t size) {{
@@ -1506,9 +1580,55 @@ static uint32_t heap_alloc_zeroed(uint32_t size) {{
     return address;
 }}
 
-/* The bump heap reclaims nothing; delete only validates that the pointer came from this heap. */
+#define ALLOCATOR_BASE UINT32_C(0xff00c000)
+static uint32_t allocator_object;
+
+static uint32_t user_allocator(uint32_t *stack) {{
+    if (!allocator_object && (allocator_object = heap_try_alloc(4 + 0x28))) {{
+        guest_write(stack, allocator_object, allocator_object + 4);
+        for (uint32_t slot = 0; slot < 0x28; slot += 4)
+            guest_write(stack, allocator_object + 4 + slot, ALLOCATOR_BASE + slot);
+    }}
+    return allocator_object;
+}}
+
+/* MAllocator::AllocSize(TInt&): return live cell count and write live payload bytes. */
+static uint32_t heap_alloc_size(uint32_t *stack, uint32_t out) {{
+    uint32_t count = 0, bytes = 0;
+    for (uint32_t offset = 0; offset < thread_heap.used;) {{
+        const uint32_t *block = heap_block(offset);
+        if (block[1] == HEAP_LIVE && heap_base + offset + 8 != allocator_object) {{
+            count++;
+            bytes += block[0] - 8;
+        }}
+        offset += block[0];
+    }}
+    guest_write(stack, out, bytes);
+    return count;
+}}
+
 static int heap_release(uint32_t address) {{
-    return address == 0 || (address >= heap_base && address - heap_base < thread_heap.used);
+    if (!address) return 1;
+    uint32_t start = address - heap_base - 8;
+    if (start >= thread_heap.used || (start & 7)) return 0;
+    uint32_t *block = heap_block(start);
+    if (block[1] != HEAP_LIVE || block[0] < 16 || block[0] > thread_heap.used - start || (block[0] & 7)) return 0;
+    uint32_t *link = &thread_heap.free_head, *prev = NULL;
+    while (*link < start) {{
+        prev = heap_block(*link);
+        link = &prev[1];
+    }}
+    block[1] = *link;
+    if (start + block[0] == block[1]) {{
+        uint32_t *next = heap_block(block[1]);
+        block[0] += next[0];
+        block[1] = next[1];
+    }}
+    if (prev && prev + prev[0] / sizeof *prev == block) {{
+        prev[0] += block[0];
+        prev[1] = block[1];
+    }} else *link = start;
+    return 1;
 }}
 
 /* Register-specified shifts use the bottom byte; amounts of 32 or more saturate (ARM ARM). kind 3 (ROR) is not used here. */
@@ -1560,6 +1680,29 @@ static int window_gc(uint32_t *stack, uint32_t slot, uint32_t context, uint32_t 
     case 0x4c: gc.brush_style = arg; break;
     case 0x88: return draw_rect(stack, arg);
     case 0xac: return draw_text(stack, arg, point, pc);
+    case 0xe4: {{ /* CWindowGc::BitBlt(const TPoint&, const CFbsBitmap*) */
+        const struct fbs_bitmap_entry *bitmap = fbs_bitmap_find(point);
+        if (!bitmap || bitmap->mode != FBS_EColor64K) return 0;
+        int64_t left = (int32_t)guest_read(stack, arg), top = (int32_t)guest_read(stack, arg + 4);
+        unsigned changed = 0;
+        for (int y = 0; y < window_height; y++) {{
+            int64_t sy = y - top;
+            if (sy < 0 || sy >= bitmap->height) continue;
+            uint32_t row = bitmap->data + (uint32_t)sy * bitmap->stride;
+            for (int x = 0; x < window_width; x++) {{
+                int64_t sx = x - left;
+                if (sx < 0 || sx >= bitmap->width) continue;
+                uint16_t value = guest_read_small(stack, row + (uint32_t)sx * 2, 2);
+                changed += pixels[y][x] != value;
+                pixels[y][x] = value;
+            }}
+        }}
+        if (changed) {{
+            gc.draw_pc = pc;
+            fprintf(stderr, "guest BitBlt pc=%08x changed_pixels=%u\\n", pc, changed);
+        }}
+        break;
+    }}
     case 0x110:
         if (arg != framework.window || gc.window) return 0;
         gc.window = arg;
@@ -1840,7 +1983,7 @@ static int base_construct_appui(uint32_t *stack, uint32_t appui, uint32_t flags)
     guest_write(stack, framework.coe_env + 0x44, framework.normal_font); /* NormalFont() */
     framework.system_gc = heap_alloc_zeroed(4);
     uint32_t gc_vtable = heap_alloc_zeroed(0x118);
-    static const uint32_t slots[] = {{ 0x24, 0x3c, 0x40, 0x48, 0x4c, 0x88, 0xac, 0x110, 0x114 }};
+    static const uint32_t slots[] = {{ 0x24, 0x3c, 0x40, 0x48, 0x4c, 0x88, 0xac, 0xe4, 0x110, 0x114 }};
     for (unsigned i = 0; i < sizeof slots / sizeof slots[0]; i++)
         guest_write(stack, gc_vtable + slots[i], GC_BASE + slots[i]);
     guest_write(stack, framework.system_gc, gc_vtable);

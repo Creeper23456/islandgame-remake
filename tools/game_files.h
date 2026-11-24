@@ -1,4 +1,5 @@
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -20,11 +21,12 @@ static int guest_string(const uint32_t *stack, uint32_t address, char *text, siz
     return 0;
 }
 
-/* Opens a Symbian path for reading, matching each component case-insensitively: <drive>:\SIMLIFE\ under the local
-   SIMLIFE tree, and E:\system\apps\island\ under the installation drive. name is modified in place. */
-static FILE *open_game_path(char *name) {
+/* Match each component case-insensitively without following symlinks. The original data tree is read-only;
+   only existing files under the installation drive's loadsave directory may be opened for writing. */
+static FILE *open_game_path(char *name, int writable) {
     const char *root;
     char *part;
+    if (writable && strncasecmp(name, "e:\\system\\apps\\island\\loadsave\\", 31)) return NULL;
     if (!strncasecmp(name, "e:\\simlife\\", 11) || !strncasecmp(name, "c:\\simlife\\", 11)) {
         /* The distribution flattens the Symbian <drive>:\\SIMLIFE\\ISLAND directory. */
         root = simlife_root;
@@ -49,13 +51,15 @@ static FILE *open_game_path(char *name) {
         for (struct dirent *entry; (entry = readdir(dir));)
             if (!strcasecmp(part, entry->d_name)) {
                 if (fd >= 0) { close(fd); fd = -1; break; }
-                fd = openat(base, entry->d_name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC | (next ? O_DIRECTORY : 0));
+                int access = writable && !next ? O_RDWR : O_RDONLY;
+                fd = openat(base, entry->d_name, access | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC | (next ? O_DIRECTORY : 0));
             }
         closedir(dir);
         if (next) { base = fd; part = next; continue; }
         struct stat st;
         if (fd < 0) return NULL;
-        FILE *file = !fstat(fd, &st) && S_ISREG(st.st_mode) ? fdopen(fd, "rb") : NULL;
+        FILE *file = !fstat(fd, &st) && S_ISREG(st.st_mode) && (!writable || st.st_nlink == 1)
+            ? fdopen(fd, writable ? "r+b" : "rb") : NULL;
         if (!file) close(fd);
         return file;
     }
@@ -65,7 +69,7 @@ static FILE *open_game_file(const uint32_t *stack, uint32_t path, uint32_t mode)
     char name[512], flags[8];
     if (!guest_string(stack, path, name, sizeof name) ||
         !guest_string(stack, mode, flags, sizeof flags) || (strcmp(flags, "rb") && strcmp(flags, "r"))) return NULL;
-    return open_game_path(name);
+    return open_game_path(name, 0);
 }
 
 static uint32_t stream_slot(FILE *file) {
@@ -81,12 +85,12 @@ static FILE *rfile_stream(const uint32_t *stack, uint32_t self) {
     return handle && handle < sizeof streams / sizeof streams[0] ? streams[handle] : NULL;
 }
 
-/* RFile::Open(RFs&, const TDesC16&, TUint aMode). Only read access is provided (EFileWrite is 0x200). Returns
+/* RFile::Open(RFs&, const TDesC16&, TUint aMode). EFileWrite is 0x200. Returns
    KErrNone, KErrNotFound (-1), or 1 for an unsupported request that the caller reports. */
 static int rfile_open(uint32_t *stack, uint32_t self, uint32_t fs, uint32_t path, uint32_t mode) {
     uint32_t length, text = text_data(stack, path, &length);
     char name[512];
-    if (guest_read(stack, fs) != RFS_SESSION_TOKEN || !text || length >= sizeof name || (mode & 0x200)) return 1;
+    if (guest_read(stack, fs) != RFS_SESSION_TOKEN || !text || length >= sizeof name) return 1;
     for (uint32_t i = 0; i < length; i++) {
         uint32_t ch = guest_read_small(stack, text + 2 * i, 2);
         if (!ch || ch > 0x7e) return 1;
@@ -95,7 +99,7 @@ static int rfile_open(uint32_t *stack, uint32_t self, uint32_t fs, uint32_t path
     name[length] = 0;
     char shown[512];
     memcpy(shown, name, length + 1);
-    FILE *file = open_game_path(name);
+    FILE *file = open_game_path(name, !!(mode & 0x200));
     uint32_t handle = file ? stream_slot(file) : 0;
     if (!handle) {
         fprintf(stderr, "RFile::Open: %s not found\n", shown);
@@ -103,6 +107,39 @@ static int rfile_open(uint32_t *stack, uint32_t self, uint32_t fs, uint32_t path
     }
     guest_write(stack, self, RFS_SESSION_TOKEN);
     guest_write(stack, self + 4, handle);
+    return 0;
+}
+
+/* RFile::Write(const TDesC8&, TInt): update from the current file position, without truncating on Open. */
+static int rfile_write(uint32_t *stack, uint32_t self, uint32_t desc, uint32_t length) {
+    FILE *file = rfile_stream(stack, self);
+    if (!file) return -8; /* KErrBadHandle */
+    uint32_t available, from = text_data(stack, desc, &available);
+    if (!from || length > available) return -6;
+    for (uint32_t i = 0; i < length; i++)
+        if (fputc((int)guest_read_small(stack, from + i, 1), file) == EOF) return -2;
+    return fflush(file) ? -2 : 0;
+}
+
+/* RFile::Flush() commits buffered file data before the caller closes the handle. */
+static int rfile_flush(const uint32_t *stack, uint32_t self) {
+    FILE *file = rfile_stream(stack, self);
+    if (!file) return -8; /* KErrBadHandle */
+    if (fflush(file) || fsync(fileno(file))) return errno == ENOSPC ? -26 : -2;
+    return 0;
+}
+
+/* RFile::SetSize(TInt) acts on an already-open file without reopening its path. */
+static int rfile_set_size(const uint32_t *stack, uint32_t self, int32_t size) {
+    FILE *file = rfile_stream(stack, self);
+    if (!file) return -8; /* KErrBadHandle */
+    if (size < 0) return -6; /* KErrArgument */
+    int fd = fileno(file), flags = fcntl(fd, F_GETFL);
+    struct stat st;
+    if (flags < 0 || fstat(fd, &st)) return -2; /* KErrGeneral */
+    if ((flags & O_ACCMODE) == O_RDONLY || !S_ISREG(st.st_mode) || st.st_nlink != 1)
+        return -21; /* KErrAccessDenied */
+    if (fflush(file) || ftruncate(fd, size)) return errno == ENOSPC ? -26 : -2;
     return 0;
 }
 
@@ -260,12 +297,14 @@ static int desc_num(uint32_t *stack, uint32_t dest, int64_t value) {
 /* Stores count elements read from src (src_width bytes each, zero-extended) into a modifiable descriptor whose
    elements are dest_width bytes, replacing its contents or appending. Symbian panics on overflow; this fails the
    emulated call instead. TDes8 and TDes16 share the header layout, so text_data serves both. */
+static inline int desc_set_length(uint32_t *stack, uint32_t dest, uint32_t length);
+
 static inline int desc_store(uint32_t *stack, uint32_t dest, unsigned dest_width, uint32_t src, unsigned src_width,
                              uint32_t count, int append) {
     uint32_t header = guest_read(stack, dest), max = guest_read(stack, dest + 4), old;
     uint32_t to = text_data(stack, dest, &old);
     uint32_t start = append ? old : 0;
-    if ((header >> 28 != 2 && header >> 28 != 3) || !to || old > max || count > max - start) return 0;
+    if (header >> 28 < 2 || header >> 28 > 4 || !to || old > max || count > max - start) return 0;
     if (dest_width == src_width && src < to + start * dest_width && to + start * dest_width < src + count * src_width) {
         /* Overlapping same-width copy: move backwards. */
         for (uint32_t i = count; i-- > 0;)
@@ -274,8 +313,7 @@ static inline int desc_store(uint32_t *stack, uint32_t dest, unsigned dest_width
         for (uint32_t i = 0; i < count; i++)
             guest_write_small(stack, to + (start + i) * dest_width, guest_read_small(stack, src + i * src_width, src_width), dest_width);
     }
-    guest_write(stack, dest, (header & 0xf0000000u) | (start + count));
-    return 1;
+    return desc_set_length(stack, dest, start + count);
 }
 
 /* TDes8/TDes16::AppendFill(TChar, TInt aLength): appends aLength copies of the character. */
@@ -316,8 +354,102 @@ static inline int desc_store_desc(uint32_t *stack, uint32_t dest, unsigned dest_
 /* TDes8/TDes16::SetLength(TInt): 0 <= length <= MaxLength. */
 static inline int desc_set_length(uint32_t *stack, uint32_t dest, uint32_t length) {
     uint32_t header = guest_read(stack, dest);
-    if ((header >> 28 != 2 && header >> 28 != 3) || length > guest_read(stack, dest + 4)) return 0;
+    unsigned type = header >> 28;
+    if (type < 2 || type > 4 || length > 0x0fffffffu || length > guest_read(stack, dest + 4)) return 0;
+    if (type == 4) {
+        uint32_t owner = guest_read(stack, dest + 8);
+        if (!owner || guest_read(stack, owner) >> 28 != 0) return 0;
+        guest_write(stack, owner, length);
+    }
     guest_write(stack, dest, (header & 0xf0000000u) | length);
+    return 1;
+}
+
+static inline int hbufc16_des(uint32_t *stack, uint32_t result, uint32_t owner) {
+    uint32_t start = owner - heap_base - 8;
+    if (start >= thread_heap.used || (start & 7)) return 0;
+    const uint32_t *block = heap_block(start);
+    if (block[1] != HEAP_LIVE || block[0] < 16 || block[0] > thread_heap.used - start || (block[0] & 7)) return 0;
+    uint32_t max = (block[0] - 12) / 2, length = guest_read(stack, owner);
+    if (length > 0x0fffffffu || length > max) return 0;
+    guest_write(stack, result, 0x40000000u | length);
+    guest_write(stack, result + 4, max);
+    guest_write(stack, result + 8, owner);
+    return 1;
+}
+
+/* TDes8/TDes16::Format subset used for numbered resources and script commands. */
+static int desc_format_int(uint32_t *stack, uint32_t dest, uint32_t format, unsigned width, int32_t number) {
+    uint32_t length, fmt = text_data(stack, format, &length), old, text = text_data(stack, dest, &old);
+    if (!fmt || !text) return 0;
+    char digits[12];
+    unsigned ndigits = (unsigned)snprintf(digits, sizeof digits, "%" PRId32, number);
+    if (ndigits >= sizeof digits) return 0;
+    /* Validate before writing; an invalid directive or overflow must not truncate a path. */
+    uint32_t total = 0;
+    int seen = 0;
+    for (uint32_t i = 0; i < length; i++, total++) {
+        if (guest_read_small(stack, fmt + width * i, width) != '%') continue;
+        if (++i == length) return 0;
+        uint32_t spec = guest_read_small(stack, fmt + width * i, width);
+        if (spec == '%') continue;
+        if (spec != 'd' || seen++) return 0;
+        total += ndigits - 1;
+    }
+    if (!desc_set_length(stack, dest, total)) return 0;
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < length; i++) {
+        uint32_t ch = guest_read_small(stack, fmt + width * i, width);
+        if (ch == '%' && guest_read_small(stack, fmt + width * ++i, width) == 'd') {
+            for (unsigned k = 0; k < ndigits; k++) guest_write_small(stack, text + width * j++, digits[k], width);
+        } else guest_write_small(stack, text + width * j++, ch, width);
+    }
+    return 1;
+}
+
+/* RDebug::Print: scene paths and physics traces. ARM variadic doubles start in r2:r3,
+   with subsequent doubles on the stack. Symbian's debug buffer is limited to 256 units. */
+static int debug_print(const uint32_t *stack, const uint32_t r[16]) {
+    uint32_t length, text = text_data(stack, r[0], &length);
+    if (!text) return 0;
+    char message[257];
+    unsigned n = 0, nargs = 0;
+    for (uint32_t i = 0; i < length && n < sizeof message - 1; i++) {
+        uint32_t ch = guest_read_small(stack, text + 2 * i, 2);
+        if (ch == '%') {
+            if (++i == length) return 0;
+            uint32_t spec = guest_read_small(stack, text + 2 * i, 2);
+            if (spec == 'f' && nargs < 6) {
+                uint64_t bits = nargs ? guest_read64(stack, r[13] + 8 * (nargs - 1)) :
+                                       (uint64_t)r[3] << 32 | r[2];
+                double value;
+                memcpy(&value, &bits, sizeof value);
+                unsigned remaining = sizeof message - 1 - n;
+                int used = snprintf(message + n, remaining + 1, "%f", value);
+                if (used < 0) return 0;
+                n += (unsigned)used < remaining ? (unsigned)used : remaining;
+                nargs++;
+                continue;
+            }
+            if (spec != '%') return 0;
+        }
+        message[n++] = (char)ch; /* SDK collapses the descriptor before DebugPrint. */
+    }
+    fputs("RDebug::Print: ", stderr);
+    fwrite(message, 1, n, stderr);
+    fputc('\n', stderr);
+    return 1;
+}
+
+static inline int tptrc16_from_z(uint32_t *stack, uint32_t result, uint32_t text) {
+    if (!text || (text & 1)) return 0;
+    uint32_t length = 0;
+    while (guest_read_small(stack, text + 2 * length, 2)) {
+        if (length == 0x0fffffffu) return 0;
+        length++;
+    }
+    guest_write(stack, result, 0x10000000u | length);
+    guest_write(stack, result + 4, text);
     return 1;
 }
 

@@ -17,6 +17,10 @@ static uint32_t text_data(const uint32_t *stack, uint32_t desc, uint32_t *len) {
     case 1: return guest_read(stack, desc + 4);
     case 2: return guest_read(stack, desc + 8);
     case 3: return desc + 8;
+    case 4: { /* EBufCPtr points to the owning EBufC header, not its text. */
+        uint32_t owner = guest_read(stack, desc + 8);
+        return owner && guest_read(stack, owner) == *len ? owner + 4 : 0;
+    }
     default: return 0;
     }
 }
@@ -89,13 +93,14 @@ static int draw_rect(const uint32_t *stack, uint32_t rect) {
     return 1;
 }
 
-static int draw_text(const uint32_t *stack, uint32_t text, uint32_t point, uint32_t pc) {
-    FT_Face face = get_face(stack, gc.font);
+static int raster_text(const uint32_t *stack, uint32_t text, uint32_t point, uint32_t font, uint32_t color,
+                       unsigned char *surface, unsigned width, unsigned height, unsigned stride, uint32_t pc) {
+    FT_Face face = get_face(stack, font);
     uint32_t len, data = text_data(stack, text, &len);
     if (!face || !data || len > 4096) return 0;
     int64_t x = (int32_t)guest_read(stack, point), baseline = (int32_t)guest_read(stack, point + 4);
     /* Symbian's glyph drawing uses pen color even with ENullPen. */
-    uint16_t pen = rgb565(gc.pen_color);
+    uint16_t pen = rgb565(color);
     unsigned changed = 0;
     for (uint32_t i = 0; i < len; i++) {
         if (FT_Load_Char(face, guest_read_small(stack, data + 2*i, 2), FT_LOAD_RENDER)) return 0;
@@ -104,27 +109,35 @@ static int draw_text(const uint32_t *stack, uint32_t text, uint32_t point, uint3
         if (bitmap->pixel_mode != FT_PIXEL_MODE_GRAY || bitmap->pitch < 0) return 0;
         for (unsigned row = 0; row < bitmap->rows; row++) {
             int64_t dy = baseline - glyph->bitmap_top + row;
-            if (dy < 0 || dy >= window_height) continue;
+            if (dy < 0 || dy >= height) continue;
             for (unsigned col = 0; col < bitmap->width; col++) {
                 int64_t dx = x + glyph->bitmap_left + col;
-                if (dx < 0 || dx >= window_width) continue;
+                if (dx < 0 || dx >= width) continue;
                 unsigned a = bitmap->buffer[row * (unsigned)bitmap->pitch + col];
-                uint16_t bg = pixels[dy][dx], blended = 0;
+                if (!a) continue;
+                unsigned char *pixel = surface + dy * stride + dx * 2;
+                uint16_t bg, blended = 0;
+                memcpy(&bg, pixel, sizeof bg);
                 for (unsigned shift = 0; shift <= 11; shift += shift == 5 ? 6 : 5) {
                     unsigned mask = shift == 5 ? 63 : 31;
                     blended |= (uint16_t)(((((pen >> shift) & mask) * a + ((bg >> shift) & mask) * (255-a) + 127) / 255) << shift);
                 }
                 changed += blended != bg;
-                pixels[dy][dx] = blended;
+                memcpy(pixel, &blended, sizeof blended);
             }
         }
         x += glyph->advance.x >> 6;
     }
-    if (changed) {
+    if (changed && pc) {
         gc.draw_pc = pc;
         fprintf(stderr, "guest DrawText pc=%08x glyphs=%u changed_pixels=%u\n", pc, len, changed);
     }
     return 1;
+}
+
+static int draw_text(const uint32_t *stack, uint32_t text, uint32_t point, uint32_t pc) {
+    return raster_text(stack, text, point, gc.font, gc.pen_color, (unsigned char *)pixels,
+                       window_width, window_height, sizeof pixels[0], pc);
 }
 
 static int publish_window(uint32_t pc) {
@@ -150,7 +163,7 @@ static int publish_window(uint32_t pc) {
     if (hold_first_frame) {
         SDL_Event event;
         while (SDL_WaitEvent(&event)) {
-            if (event.type == SDL_QUIT || (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
+            if (event.type == SDL_QUIT) {
                 fprintf(stderr, "first frame: exit on SDL event type 0x%x\n", event.type);
                 SDL_Quit();
                 exit(0);

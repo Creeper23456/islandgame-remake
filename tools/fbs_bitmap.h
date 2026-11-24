@@ -3,10 +3,18 @@
 #define FBS_EColor64K UINT32_C(7)
 #define FBS_BITMAP_SLOTS 8
 #define FBS_BITMAP_UTIL_SIZE 40
+#define FBS_BITMAP_BASE UINT32_C(0xff00b000)
 
 static struct fbs_bitmap_entry {
     uint32_t object, width, height, mode, stride, data;
 } fbs_bitmaps[FBS_BITMAP_SLOTS];
+
+/* CFbsBitmap::ScanLineLength(TInt, TDisplayMode), for the supported RGB565 mode. */
+static int fbs_scanline(uint32_t width, uint32_t mode, uint32_t *stride) {
+    if (mode != FBS_EColor64K || width > (INT32_MAX - 3u) / 2) return 0;
+    *stride = (width * 2 + 3) & ~UINT32_C(3);
+    return 1;
+}
 
 static struct fbs_bitmap_entry *fbs_bitmap_find(uint32_t object) {
     for (unsigned i = 0; i < FBS_BITMAP_SLOTS; i++)
@@ -14,10 +22,27 @@ static struct fbs_bitmap_entry *fbs_bitmap_find(uint32_t object) {
     return NULL;
 }
 
-/* CFbsBitmap() and Reset(): forget this object's pixel mapping. Guest heap memory is not reclaimed. */
-static void fbs_bitmap_reset(uint32_t object) {
+/* Reset and destruction release the pixels, which belong to the bitmap. */
+static int fbs_bitmap_reset(uint32_t object) {
     struct fbs_bitmap_entry *entry = fbs_bitmap_find(object);
-    if (entry) memset(entry, 0, sizeof *entry);
+    if (entry) {
+        if (!heap_release(entry->data)) return 0;
+        memset(entry, 0, sizeof *entry);
+    }
+    return 1;
+}
+
+static int fbs_bitmap_construct(uint32_t *stack, uint32_t object) {
+    /* CBase-derived EABI vtable: complete and deleting destructor. */
+    static uint32_t vtable;
+    if (!vtable) {
+        vtable = heap_try_alloc(8);
+        if (!vtable) return 0;
+        guest_write(stack, vtable, FBS_BITMAP_BASE);
+        guest_write(stack, vtable + 4, FBS_BITMAP_BASE + 4);
+    }
+    guest_write(stack, object, vtable);
+    return 1;
 }
 
 /* CFbsBitmap::Create(const TSize&, TDisplayMode). Returns 0 on any unsupported or failed request. */
@@ -28,12 +53,13 @@ static int fbs_bitmap_create(uint32_t *stack, uint32_t object, uint32_t size, ui
     }
     uint32_t width = guest_read(stack, size), height = guest_read(stack, size + 4);
     if (!width || !height || width > 4096 || height > 4096) return 0;
-    fbs_bitmap_reset(object);
+    if (!fbs_bitmap_reset(object)) return 0;
     struct fbs_bitmap_entry *slot = NULL;
     for (unsigned i = 0; i < FBS_BITMAP_SLOTS && !slot; i++)
         if (!fbs_bitmaps[i].data) slot = &fbs_bitmaps[i];
     if (!slot) return 0;
-    uint32_t stride = (width * 2 + 3) & ~UINT32_C(3); /* EColor64K scan lines are word aligned */
+    uint32_t stride;
+    if (!fbs_scanline(width, mode, &stride)) return 0;
     uint32_t data = heap_try_alloc(stride * height);
     if (!data) return 0;
     slot->object = object;
@@ -130,6 +156,14 @@ static int bitgc_slot(uint32_t *stack, uint32_t slot, uint32_t *r) {
     case 0x4c: /* CGraphicsContext::SetBrushStyle(TBrushStyle) */
         guest_write(stack, r[0] + 20, r[1]);
         return 1;
+    case 0xac: { /* CGraphicsContext::DrawText(const TDesC16&, const TPoint&) */
+        uint32_t device = guest_read(stack, r[0] + 4);
+        if (!device) return 0;
+        struct fbs_bitmap_entry *bitmap = fbs_bitmap_find(guest_read(stack, device + 4));
+        if (!bitmap) return 0;
+        return raster_text(stack, r[1], r[2], guest_read(stack, r[0] + 28), guest_read(stack, r[0] + 8),
+                           heap_word(bitmap->data), bitmap->width, bitmap->height, bitmap->stride, 0);
+    }
     default:
         return 0;
     }
