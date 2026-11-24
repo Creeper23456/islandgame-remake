@@ -335,6 +335,11 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
         if module is None:
             blocks[encoded] = [f'return unsupported({encoded:#x}, 0);']
             continue
+        # This menu action launches the Symbian browser via AppArc. Keep the original
+        # menu logic and descriptor, but hand off to the desktop browser instead.
+        if app_profile and module is image and encoded == 0x6b49c and image.load(pc) == 0xe1a0c00d:
+            blocks[encoded] = ['open_official_website(stack, r[1]);', 'target = r[14]; goto dispatch;']
+            continue
         w = module.load(pc, width)
         next_pc = encoded + width
         predicate = None

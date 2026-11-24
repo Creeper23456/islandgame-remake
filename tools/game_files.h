@@ -407,6 +407,25 @@ static int desc_format_int(uint32_t *stack, uint32_t dest, uint32_t format, unsi
     return 1;
 }
 
+/* The original menu passes its URL as a TDesC16; only web URLs leave the guest. */
+static void open_official_website(const uint32_t *stack, uint32_t descriptor) {
+    uint32_t length, text = text_data(stack, descriptor, &length);
+    char url[257];
+    if (!text || length >= sizeof url) goto invalid;
+    for (uint32_t i = 0; i < length; i++) {
+        uint32_t ch = guest_read_small(stack, text + 2 * i, 2);
+        if (ch < 0x21 || ch > 0x7e || ch == '\\') goto invalid;
+        url[i] = (char)ch;
+    }
+    url[length] = 0;
+    const char *host = !strncmp(url, "https://", 8) ? url + 8 : !strncmp(url, "http://", 7) ? url + 7 : NULL;
+    if (!host || !*host || strchr("/?#", *host)) goto invalid;
+    if (SDL_OpenURL(url) < 0) fprintf(stderr, "Could not open the official website: %s\n", SDL_GetError());
+    return;
+invalid:
+    fputs("Invalid official website URL\n", stderr);
+}
+
 /* RDebug::Print: scene paths and physics traces. ARM variadic doubles start in r2:r3,
    with subsequent doubles on the stack. Symbian's debug buffer is limited to 256 units. */
 static int debug_print(const uint32_t *stack, const uint32_t r[16]) {
