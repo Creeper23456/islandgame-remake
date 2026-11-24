@@ -2,7 +2,7 @@
 
 1. `tools/extract_e32.py` 从本地原版 ZIP 内的 SIS 提取 `IsLand_3rd.exe`、`SimMediaEngineDll.dll` 和 `SimDeviceEngineDll.dll`，并按开关把应用资源和初始存档写入本地安装盘。
 2. `tools/recomp_start.py` 读取 E32 重定位与导入，从原 `_E32Startup` 等入口遍历 ARM/Thumb 代码，生成包含原游戏模块和宿主 ABI 的 C；Clang 把它编译为桌面机器码。原游戏状态机驱动启动、开局影片、脚本和场景。EKA2L1 只供查阅接口与设计，不参与构建或运行。
-3. `tools/*.h` 提供宿主文件、位图、窗口、线程、同步和音频等接口。SDL2 接收键盘事件并输出原游戏绘制的 RGB565 帧和解码出的 PCM。原菜单「访问官网」把原游戏提供的 URL 交给 `SDL_OpenURL`；手测首关无需选择该项。
+3. `tools/*.h` 提供宿主文件、位图、窗口、线程、同步和音频等接口。SDL2 接收键盘事件并输出原游戏绘制的 RGB565 帧和解码出的 PCM。原菜单「访问官网」把原游戏提供的 URL 交给 `SDL_OpenURL`；手测游戏无需选择该项。
 
 ## 诊断
 
