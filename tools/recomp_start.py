@@ -305,6 +305,7 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
         if any((image.imports.get(slot, ('', 0))[0].lower(), image.imports.get(slot, ('', 0))[1]) != symbol
                for slot, symbol in virtual_imports.items()):
             raise ValueError('unexpected Lament Island virtual imports')
+        lifecycle_targets.add(image.load(control_vtable + 0x0c))  # OfferKeyEventL
         # CCoeControl::SetExtent invokes the derived SizeChanged at slot 0x6c.
         lifecycle_targets.add(image.load(control_vtable + 0x6c))
         lifecycle_targets.add(image.load(control_vtable + 0xb0))
@@ -1337,6 +1338,7 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                   '        fprintf(stderr, "AppUi constructed; foreground callback at 0x%08x\\n", target);',
                   '        r[14] = 0xff000030; goto dispatch;',
                   '    case 0xff000030:',
+                  '        { int status = pump_window_input(stack, r[13]); if (status) return status < 0 ? 0 : status; }',
                   '        { int status = threads_run_ready(stack); if (status) return status; }',
                   '        if (!next_timer_event(stack, &r[0], &target)) return 3;',
                   '        r[14] = 0xff000030; goto dispatch;']
@@ -2196,6 +2198,56 @@ static int run_nested_event(uint32_t *stack, uint32_t target, uint32_t argument,
     nested.r[13] = sp;
     nested.r[14] = GUEST_THREAD_SENTINEL;
     return guest_run(&nested, stack) == 0;
+}}
+
+/* Deliver one SDL transition per scheduler pass so a short tap reaches the guest update. */
+static int pump_window_input(uint32_t *stack, uint32_t sp) {{
+    if (!framework.control || !SDL_WasInit(SDL_INIT_VIDEO)) return 0;
+    SDL_Event event;
+    SDL_PumpEvents();
+    int queued;
+    while ((queued = SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT)) > 0) {{
+        if (event.type == SDL_QUIT) return -1;
+        if ((event.type != SDL_KEYDOWN && event.type != SDL_KEYUP) || event.key.repeat) continue;
+        uint32_t scan;
+        /* Physical keypad positions retain their phone mapping with Num Lock off. */
+        switch (event.key.keysym.scancode) {{
+        case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: scan = 0xa4; break; /* left softkey */
+        case SDL_SCANCODE_ESCAPE: scan = 0xa5; break; /* right softkey */
+        case SDL_SCANCODE_RSHIFT: scan = 0xa7; break; /* D-Pad center / OK */
+        case SDL_SCANCODE_LEFT:   scan = 0x0e; break;
+        case SDL_SCANCODE_RIGHT:  scan = 0x0f; break;
+        case SDL_SCANCODE_UP:     scan = 0x10; break;
+        case SDL_SCANCODE_DOWN:   scan = 0x11; break;
+        case SDL_SCANCODE_KP_7: scan = '1'; break;
+        case SDL_SCANCODE_KP_8: scan = '2'; break;
+        case SDL_SCANCODE_KP_9: scan = '3'; break;
+        case SDL_SCANCODE_KP_4: scan = '4'; break;
+        case SDL_SCANCODE_KP_5: scan = '5'; break;
+        case SDL_SCANCODE_KP_6: scan = '6'; break;
+        case SDL_SCANCODE_KP_1: scan = '7'; break;
+        case SDL_SCANCODE_KP_2: scan = '8'; break;
+        case SDL_SCANCODE_KP_3: scan = '9'; break;
+        case SDL_SCANCODE_PAGEUP:   scan = 0x7f; break; /* # */
+        case SDL_SCANCODE_PAGEDOWN: scan = 0x85; break; /* * */
+        default: continue;
+        }}
+        uint32_t key_event = sp - 16;
+        guest_write(stack, key_event, 0); /* iCode is only set for EEventKey, which the game ignores. */
+        guest_write(stack, key_event + 4, scan);
+        guest_write(stack, key_event + 8, 0);  /* iModifiers */
+        guest_write(stack, key_event + 12, 0); /* iRepeats */
+        struct guest_thread nested = {{0}};
+        nested.target = guest_read(stack, guest_read(stack, framework.control) + 0x0c);
+        nested.r[0] = framework.control;
+        nested.r[1] = key_event;
+        nested.r[2] = event.type == SDL_KEYDOWN ? 3 : 2; /* EEventKeyDown/Up */
+        nested.r[13] = key_event;
+        nested.r[14] = GUEST_THREAD_SENTINEL;
+        return guest_run(&nested, stack);
+    }}
+    if (queued < 0) {{ fprintf(stderr, "SDL keyboard events: %s\\n", SDL_GetError()); return 3; }}
+    return 0;
 }}
 
 /* CleanupStack::PopAndDestroy(count): pops and destroys from the top. A CBase is deleted through its deleting
