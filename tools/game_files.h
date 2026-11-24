@@ -426,28 +426,36 @@ invalid:
     fputs("Invalid official website URL\n", stderr);
 }
 
-/* RDebug::Print: scene paths and physics traces. ARM variadic doubles start in r2:r3,
-   with subsequent doubles on the stack. Symbian's debug buffer is limited to 256 units. */
+/* RDebug::Print: the descriptor occupies r0. Variadic words start in r1,
+   continue on the stack after r3, and align to two words for doubles. */
 static int debug_print(const uint32_t *stack, const uint32_t r[16]) {
     uint32_t length, text = text_data(stack, r[0], &length);
     if (!text) return 0;
     char message[257];
-    unsigned n = 0, nargs = 0;
+    unsigned n = 0, arg = 1;
     for (uint32_t i = 0; i < length && n < sizeof message - 1; i++) {
         uint32_t ch = guest_read_small(stack, text + 2 * i, 2);
         if (ch == '%') {
             if (++i == length) return 0;
             uint32_t spec = guest_read_small(stack, text + 2 * i, 2);
-            if (spec == 'f' && nargs < 6) {
-                uint64_t bits = nargs ? guest_read64(stack, r[13] + 8 * (nargs - 1)) :
-                                       (uint64_t)r[3] << 32 | r[2];
-                double value;
-                memcpy(&value, &bits, sizeof value);
+            if (spec == 'd' || spec == 'f') {
                 unsigned remaining = sizeof message - 1 - n;
-                int used = snprintf(message + n, remaining + 1, "%f", value);
+                int used;
+                if (spec == 'd') {
+                    uint32_t word = arg < 4 ? r[arg] : guest_read(stack, r[13] + 4 * (arg - 4));
+                    used = snprintf(message + n, remaining + 1, "%d", (int32_t)word);
+                    arg++;
+                } else {
+                    arg = (arg + 1) & ~1u;
+                    uint64_t bits = arg < 4 ? (uint64_t)r[3] << 32 | r[2] :
+                                              guest_read64(stack, r[13] + 4 * (arg - 4));
+                    double value;
+                    memcpy(&value, &bits, sizeof value);
+                    used = snprintf(message + n, remaining + 1, "%f", value);
+                    arg += 2;
+                }
                 if (used < 0) return 0;
                 n += (unsigned)used < remaining ? (unsigned)used : remaining;
-                nargs++;
                 continue;
             }
             if (spec != '%') return 0;
