@@ -880,15 +880,27 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             ops = [f'r[{(w >> 12) & 15}] = UINT32_C({value});', jump(next_pc)]
         elif not thumb and w & 0xffff0000 == 0xe3e00000 and (w >> 12) & 15 != 15:
             ops = [f'r[{(w >> 12) & 15}] = ~UINT32_C({arm_immediate(w)});', jump(next_pc)]
-        elif not thumb and ((w & 0xfe000000 == 0xe2000000) or (w & 0xfe000ff0 == 0xe0000000)) \
-                and ((w >> 21) & 15) in (2, 4, 5, 6, 10, 11):
+        elif not thumb and w & 0x0ff0f090 == 0x01500010 \
+                and 15 not in ((w >> 16) & 15, (w >> 8) & 15, w & 15) and (w >> 5) & 3 != 3:
+            rn, rs, rm, kind = (w >> 16) & 15, (w >> 8) & 15, w & 15, (w >> 5) & 3
+            ops = [f'a = r[{rn}]; b = arm_shift(r[{rm}], {kind}, r[{rs}]); result = a - b;',
+                   'z = result == 0; n = result >> 31; c = a >= b; v = ((a ^ b) & (a ^ result)) >> 31;', jump(next_pc)]
+        elif not thumb and ((w & 0xfe000000 == 0xe2000000) or
+                            (w & 0xfe000010 == 0xe0000000 and (w >> 5) & 3 != 3)) \
+                and ((w >> 21) & 15) in (2, 3, 4, 5, 6, 7, 10, 11):
             opcode, rn, rd = (w >> 21) & 15, (w >> 16) & 15, (w >> 12) & 15
-            subtract = opcode in (2, 6, 10)
+            subtract = opcode in (2, 3, 6, 7, 10)
             immediate = bool(w & 0x02000000)
             left = f'UINT32_C({pc + 8:#x})' if rn == 15 else f'r[{rn}]'
             right = f'UINT32_C({arm_immediate(w)})' if immediate else (
                 f'UINT32_C({pc + 8:#x})' if w & 15 == 15 else f'r[{w & 15}]')
-            extra = 'c' if opcode == 5 else '1 - c' if opcode == 6 else '0'
+            if not immediate:
+                kind, amount = (w >> 5) & 3, (w >> 7) & 31
+                if kind or amount:
+                    right = f'arm_shift({right}, {kind}, {amount or 32})'
+            if opcode in (3, 7):
+                left, right = right, left
+            extra = 'c' if opcode == 5 else '1 - c' if opcode in (6, 7) else '0'
             if (opcode in (10, 11) and (not w & (1 << 20) or rd)) or rd == 15:
                 ops = [f'return unsupported({pc:#x}, {w:#x});']
             else:
@@ -915,12 +927,41 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                 product = f'{product} + (((uint64_t)r[{hi}] << 32) | r[{lo}])'
             ops = [f'{{ uint64_t product = {product}; r[{lo}] = (uint32_t)product; r[{hi}] = (uint32_t)(product >> 32); }}',
                    jump(next_pc)]
-        elif not thumb and w & 0xfff0f0f0 == 0xe0000090 and 15 not in ((w >> 16) & 15, (w >> 8) & 15, w & 15):
+        elif not thumb and w & 0xffe0f0f0 == 0xe0000090 and 15 not in ((w >> 16) & 15, (w >> 8) & 15, w & 15):
             rd, rs, rm = (w >> 16) & 15, (w >> 8) & 15, w & 15
-            ops = [f'r[{rd}] = r[{rm}] * r[{rs}];', jump(next_pc)]
+            ops = [f'r[{rd}] = r[{rm}] * r[{rs}];']
+            if w & (1 << 20):
+                ops.append(f'z = r[{rd}] == 0; n = r[{rd}] >> 31;')
+            ops.append(jump(next_pc))
         elif not thumb and w & 0xfff000f0 == 0xe0200090 and 15 not in ((w >> 16) & 15, (w >> 12) & 15, (w >> 8) & 15, w & 15):
             rd, rn, rs, rm = (w >> 16) & 15, (w >> 12) & 15, (w >> 8) & 15, w & 15  # MLA Rd = Rm * Rs + Rn
             ops = [f'r[{rd}] = r[{rm}] * r[{rs}] + r[{rn}];', jump(next_pc)]
+        elif not thumb and w & 0x0e100090 == 0x00100010 and (w >> 21) & 15 in (0, 1, 8, 9, 12, 13, 14, 15) \
+                and (w >> 5) & 3 != 3 and 15 not in ((w >> 16) & 15, (w >> 12) & 15, (w >> 8) & 15, w & 15):
+            opcode, rn, rd, rs, rm, kind = (w >> 21) & 15, (w >> 16) & 15, (w >> 12) & 15, (w >> 8) & 15, w & 15, (w >> 5) & 3
+            if opcode in (8, 9) and rd != 0:
+                ops = [f'return unsupported({pc:#x}, {w:#x});']
+            else:
+                carry = ('b <= 32 ? (a >> (32 - b)) & 1 : 0',
+                         'b <= 32 ? (a >> (b - 1)) & 1 : 0',
+                         '(a >> (b >= 32 ? 31 : b - 1)) & 1')[kind]
+                expr = dp_expr({8: 0, 9: 1}.get(opcode, opcode), rn, f'arm_shift(a, {kind}, b)')
+                ops = [f'a = r[{rm}]; b = r[{rs}] & 255;', f'if (b) c = {carry};',
+                       f'result = {expr}; z = result == 0; n = result >> 31;']
+                if opcode not in (8, 9):
+                    ops.append(f'r[{rd}] = result;')
+                ops.append(jump(next_pc))
+        elif not thumb and w & 0x0e100ff0 == 0x00100000 and (w >> 21) & 15 in (0, 1, 8, 9, 12, 13, 14, 15) \
+                and 15 not in ((w >> 16) & 15, (w >> 12) & 15, w & 15):
+            opcode, rn, rd, rm = (w >> 21) & 15, (w >> 16) & 15, (w >> 12) & 15, w & 15
+            if opcode in (8, 9) and rd != 0:
+                ops = [f'return unsupported({pc:#x}, {w:#x});']
+            else:
+                expr = dp_expr({8: 0, 9: 1}.get(opcode, opcode), rn, f'r[{rm}]')
+                ops = [f'result = {expr}; z = result == 0; n = result >> 31;']
+                if opcode not in (8, 9):
+                    ops.append(f'r[{rd}] = result;')
+                ops.append(jump(next_pc))
         elif not thumb and w & 0xfff0f000 == 0xe3100000 and (w >> 16) & 15 != 15:
             imm, rn = arm_immediate(w), (w >> 16) & 15
             ops = [f'result = r[{rn}] & UINT32_C({imm}); z = result == 0; n = result >> 31;']
@@ -933,6 +974,15 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             if w & 0xf00:
                 ops.append(f'c = {imm >> 31};')
             ops.append(jump(next_pc))
+        elif not thumb and w & 0x0fff0010 == 0x01b00000 and (w >> 5) & 3 != 3 \
+                and 15 not in ((w >> 12) & 15, w & 15):
+            rd, rm, kind, amount = (w >> 12) & 15, w & 15, (w >> 5) & 3, (w >> 7) & 31
+            amount = amount or (32 if kind else 0)
+            ops = [f'a = r[{rm}];']
+            if amount:
+                bit = 32 - amount if kind == 0 else amount - 1
+                ops.append(f'c = (a >> {bit}) & 1;')
+            ops += [f'r[{rd}] = arm_shift(a, {kind}, {amount}); z = r[{rd}] == 0; n = r[{rd}] >> 31;', jump(next_pc)]
         elif not thumb and w & 0x0e000090 == 0x00000010 and not w & (1 << 20) and (w >> 21) & 15 in DP_NO_FLAGS_OPCODES \
                 and (w >> 16) & 15 != 15 and (w >> 12) & 15 != 15 and (w >> 8) & 15 != 15 and w & 15 != 15 \
                 and (w >> 5) & 3 != 3:
@@ -961,8 +1011,30 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             sign = f'(0u - ({src} >> 31))'
             value = f'(({src} >> {shift}) | ({sign} << {32 - shift}))' if shift else sign
             ops = [f'r[{rd}] = {value};', jump(next_pc)]
-        elif not thumb and w & 0xffff0000 == 0xe59f0000 and (w >> 12) & 15 != 15:
-            literal = module.load(pc + 8 + (w & 0xfff))
+        elif not thumb and w & 0xfffffff0 == 0xe79ff100 and predicate == ARM_CONDITIONS[9] and w & 15 != 15:
+            # CMP Rm,#limit; LDRLS pc,[pc,Rm,LSL #2]; B default; relocated table.
+            rm = w & 15
+            compare = module.load(pc - 4)
+            count = arm_immediate(compare) + 1
+            table = pc + 8
+            if (compare & 0xfffff000 == (0xe3500000 | rm << 16)
+                    and module.load(pc + 4) >> 24 == 0xea
+                    and table + count * 4 <= module.base + module.code_size
+                    and all(slot in module.relocated for slot in range(table, table + count * 4, 4))):
+                cases = {}
+                for index in range(count):
+                    cases.setdefault(module.load(table + 4 * index), []).append(index)
+                ops = [f'switch (r[{rm}]) {{']
+                for dest, indices in cases.items():
+                    ops.append(' '.join(f'case {index}:' for index in indices) + ' ' + jump(dest))
+                ops.extend([f'default: return unsupported({encoded:#x}, {w:#x});', '}'])
+            else:
+                ops = [f'return unsupported({encoded:#x}, {w:#x});']
+        elif not thumb and w == 0xe51ff004 and pc + 4 in module.relocated:
+            ops = [jump(module.load(pc + 4))]
+        elif not thumb and w & 0xff7f0000 == 0xe51f0000 and (w >> 12) & 15 != 15:
+            offset = w & 0xfff
+            literal = module.load(pc + 8 + (offset if w & (1 << 23) else -offset))
             rd = (w >> 12) & 15
             # The function-form application factory is passed in r1 immediately
             # before the constructor call. Seed that callback at build time.
@@ -1022,6 +1094,12 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                 if writeback:
                     ops.append(f'r[{rn}] = {"address" if pre else moved};')
                 ops.append(jump(next_pc))
+        elif not thumb and w & 0xfff0f070 == 0xe790f000 and 15 not in ((w >> 16) & 15, w & 15):
+            rn, rm, amount = (w >> 16) & 15, w & 15, (w >> 7) & 31
+            if module.load(pc - 4) == 0xe1a0e00f:  # MOV lr, pc
+                call_returns.add(next_pc)
+                pending.append(next_pc)
+            ops = [f'target = guest_read(stack, r[{rn}] + (r[{rm}] << {amount})); goto dispatch;']
         elif not thumb and w & 0x0e000010 == 0x06000000 and (w >> 16) & 15 != 15 and (w >> 12) & 15 != 15 \
                 and w & 15 != 15 and (w & (1 << 24) or not w & (1 << 21)) and not (w >> 5 & 3 == 3 and not w >> 7 & 31):
             # Word/byte transfers with a register offset and immediate shift; RRX and post-indexed writeback are handled
@@ -1049,6 +1127,8 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             if writeback or not pre:
                 ops.append(f'r[{rn}] = {"address" if pre else moved};')
             ops.append(jump(next_pc))
+        elif not thumb and w == 0xe49df004:  # LDR pc, [sp], #4 (single-register POP)
+            ops = ['target = stack_read(stack, r[13]);', 'r[13] += 4;', 'goto dispatch;']
         elif not thumb and w & 0x0f600000 == 0x04000000 and (w >> 16) & 15 != 15 and (w >> 12) & 15 != 15 \
                 and (w >> 16) & 15 != (w >> 12) & 15:
             rn, rd, offset = (w >> 16) & 15, (w >> 12) & 15, w & 0xfff
