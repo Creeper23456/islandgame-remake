@@ -4,7 +4,9 @@
 
 - 原游戏 ARM/Thumb 代码在构建时翻译并编译成桌面机器码。Symbian ABI 由本项目的宿主实现。不得用模拟器、JIT 或指令解释器代替这条路径。
 - EKA2L1 仅供查阅 Symbian 接口与设计，本机参考工具路径：`$HOME/.local/share/islandgame-first-frame/EKA2L1.AppImage`。不启动、不链接、不引入为运行依赖。
+- Shipwright（https://github.com/HarbourMasters/Shipwright）是桌面移植的主要架构参考，本地独立克隆位于 `../reference/Shipwright`。参考其原作逻辑与宿主的分层、本地资产提取、输入和存档接口设计；它不是本项目的构建或运行依赖，不照搬其运行机制，Symbian ABI 仍以原二进制、导入表和 SDK 为准。
 - 首帧必须由原游戏逻辑触发并有实际像素输出；宿主空窗口、单独解码素材或伪造画面不算。遇到未知指令或接口时报告地址或 DLL/ordinal，不默默返回成功。
+- 开局影片后的首个可玩场景称为「序章」，不等于「第一章」。报告验收时分别注明序章、第一章和存档是否验证。
 - 原游戏包、SIS、SIMLIFE、固件、提取及翻译产物、存档、日志、密钥和机器私有配置只留本机，不进入 Git 或发布包。
 
 ## 协作与 Git
