@@ -284,6 +284,8 @@ HOST_ENTRY_HOOKS = {
     0x68f80: 'host_scene_alpha(stack, r[10]);',  # immediately after guest alpha, before HUD
     0x711f0: 'host_tris_project(stack, r);',  # pre-projection camera-space batch (opt-in)
     0x70e44: 'host_tris_plan_forward(stack, r);',  # validate and optionally render before forward raster dispatch
+    0x698cc: 'timing_frame(stack, r[0]);',  # ISLAND_TIMING_LOG=1: frame interval and media stream state
+    0x59bf4: 'timing_ret(r[0]);',  # ISLAND_TIMING_LOG=1: value returned by the CGame tick (vtable +0xc)
     0x83fa8: 'host_tris_push(stack, r, 0);',
     0x85bb0: 'host_tris_push(stack, r, 6);',
     0x7f854: 'host_tris_push(stack, r, 5);',
@@ -637,7 +639,7 @@ def lift(image, entry, reason, attach=False, game_dlls=(), trace=False):
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 925):
                 ops = ['if (!create_timer(stack, r[0])) return 3;', 'r[0] = 0; target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 928):
-                ops = ['if (!schedule_timer(stack, r[0], r[1], r[2])) return 3;', 'target = r[14]; goto dispatch;']
+                ops = ['if (!schedule_timer(stack, r[0], r[1], r[2], r[14])) return 3;', 'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1090):
                 ops = ['if (!set_active(stack, r[0])) return 3;', 'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 634):
@@ -671,7 +673,7 @@ def lift(image, entry, reason, attach=False, game_dlls=(), trace=False):
                 ops = ['r[0] = new_periodic(stack, r[0]);',
                        'if (!r[0]) return 3;', 'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1381):
-                ops = ['if (!start_periodic(stack, r[0], r[1], r[2], r[3], guest_read(stack, r[13]))) return 3;',
+                ops = ['if (!start_periodic(stack, r[0], r[1], r[2], r[3], guest_read(stack, r[13]), r[14])) return 3;',
                        'target = r[14]; goto dispatch;']
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 593):
                 ops = ['if (r[0] & 0x80000000u) return unhandled_leave(r[0], r[14]);',
@@ -962,6 +964,7 @@ def lift(image, entry, reason, attach=False, game_dlls=(), trace=False):
                 # again on a later pass; the main thread has nothing else runnable and sleeps on the host.
                 ops = ['if (is_guest_thread(ctx)) { target = r[14]; return THREAD_YIELD; }',
                        '{ struct timespec delay = { (time_t)(r[0] / 1000000), (long)(r[0] % 1000000) * 1000 };',
+                       '  if (timing_enabled() && r[0] > 1000) fprintf(stderr, "timing: after delay_us=%u lr=0x%08x\\n", r[0], r[14]);',
                        '  if ((int32_t)r[0] > 0) nanosleep(&delay, NULL); }',
                        'target = r[14]; goto dispatch;']
             else:
@@ -2302,7 +2305,34 @@ static uint32_t new_periodic(uint32_t *stack, uint32_t priority) {{
     return create_timer(stack, timer + 28) && add_active(stack, timer) ? timer : 0;
 }}
 
-static int schedule_timer(uint32_t *stack, uint32_t handle, uint32_t status, uint32_t delay) {{
+/* ISLAND_TIMING_LOG=1: log each RTimer arm (delay) and the interval between GameSceneProcessFrame (0x698cc) entries. */
+static int timing_log = -1;
+static uint64_t timing_now_us(void) {{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}}
+static int timing_enabled(void) {{
+    if (timing_log < 0) {{ const char *text = getenv("ISLAND_TIMING_LOG"); timing_log = text && !strcmp(text, "1"); }}
+    return timing_log;
+}}
+static void timing_frame(uint32_t *stack, uint32_t session) {{
+    static uint64_t last;
+    if (!timing_enabled()) return;
+    uint64_t now = timing_now_us();
+    uint32_t sound = guest_read(stack, session + 0x178), stream = sound ? guest_read(stack, sound + 8) : 0;
+    uint32_t inner = stream ? guest_read(stack, stream + 4) : 0;
+    int32_t state = inner ? (int32_t)guest_read(stack, inner + 16) : -3;
+    if (last) fprintf(stderr, "timing: frame dt_us=%llu media_state=%d s1cdc=0x%x f1d20=%u f809=%u\\n", (unsigned long long)(now - last), state,
+                      guest_read(stack, session + 0x1cdc), guest_read(stack, session + 0x1d20),
+                      (unsigned)guest_read_small(stack, session + 0x809, 1));
+    last = now;
+}}
+static void timing_ret(uint32_t value) {{
+    if (timing_enabled()) fprintf(stderr, "timing: tick_ret=%u\\n", value);
+}}
+
+static int schedule_timer(uint32_t *stack, uint32_t handle, uint32_t status, uint32_t delay, uint32_t lr) {{
     uint32_t id = guest_read(stack, handle);
     struct timespec now;
     if (!id || id > framework.next_timer || timers[id - 1].status || delay > INT32_MAX ||
@@ -2311,6 +2341,8 @@ static int schedule_timer(uint32_t *stack, uint32_t handle, uint32_t status, uin
                 handle, id, status, id && id <= framework.next_timer ? timers[id - 1].status : 0);
         return 0;
     }}
+    if (timing_enabled()) fprintf(stderr, "timing: arm handle=0x%08x status=0x%08x delay_us=%u lr=0x%08x id=%u\\n",
+                                  handle, status, delay, lr, id);
     timers[id - 1].deadline = (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000 + delay;
     timers[id - 1].status = status;
     guest_write(stack, status, 0x80000001u); /* KRequestPending */
@@ -2326,8 +2358,8 @@ static int set_active(uint32_t *stack, uint32_t object) {{
 }}
 
 static int start_periodic(uint32_t *stack, uint32_t object, uint32_t delay, uint32_t interval,
-                          uint32_t callback, uint32_t argument) {{
-    if (interval > INT32_MAX || !callback || !schedule_timer(stack, object + 28, object + 4, delay)) return 0;
+                          uint32_t callback, uint32_t argument, uint32_t lr) {{
+    if (interval > INT32_MAX || !callback || !schedule_timer(stack, object + 28, object + 4, delay, lr)) return 0;
     timers[guest_read(stack, object + 28) - 1].periodic = object;
     guest_write(stack, object + 32, interval);
     guest_write(stack, object + 36, callback);
@@ -3194,7 +3226,8 @@ static int next_timer_event(uint32_t *stack, uint32_t *argument, uint32_t *targe
             guest_write(stack, object + 8, flags & ~1u);
             uint32_t id = guest_read(stack, object + 28);
             if (id && id <= framework.next_timer && timers[id - 1].periodic == object) {{
-                if (!schedule_timer(stack, object + 28, object + 4, guest_read(stack, object + 32)) ||
+                /* A host CPeriodic rearm has no guest return address. */
+                if (!schedule_timer(stack, object + 28, object + 4, guest_read(stack, object + 32), 0) ||
                     !set_active(stack, object)) return 0;
                 *argument = guest_read(stack, object + 40);
                 *target = guest_read(stack, object + 36);

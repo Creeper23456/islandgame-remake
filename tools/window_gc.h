@@ -1157,7 +1157,7 @@ static void present_destination(int width, int height, int *x, int *y, int *w, i
     *h = destination_height;
 }
 
-static int present_frame(void) {
+static int present_frame_run(void) {
     if (!present_vk_check(vkWaitForFences(vk_present.device, 1, &vk_present.frame_fence,
                                           VK_TRUE, UINT64_MAX),
                           "vkWaitForFences"))
@@ -1305,6 +1305,27 @@ static int present_frame(void) {
         vk_present.logged_h = height;
     }
     return 1;
+}
+
+/* ISLAND_TIMING_LOG=1: mean/max milliseconds spent inside one presentation (fence wait, acquire, compose, present). */
+static int present_frame(void) {
+    static int enabled = -1;
+    static double sum, peak;
+    static unsigned frames;
+    if (enabled < 0) { const char *text = getenv("ISLAND_TIMING_LOG"); enabled = text && !strcmp(text, "1"); }
+    if (!enabled) return present_frame_run();
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    int ok = present_frame_run();
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) * 1e-6;
+    sum += ms;
+    if (ms > peak) peak = ms;
+    if (++frames == 60) {
+        fprintf(stderr, "timing: present mean=%.2f ms max=%.2f ms over 60\n", sum / 60, peak);
+        sum = peak = 0; frames = 0;
+    }
+    return ok;
 }
 
 static void debug_frame_presented(void); /* tools/pc_debug.h */
