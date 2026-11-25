@@ -6,10 +6,22 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
-enum { window_width = 176, window_height = 208, window_scale = 3 };
-static uint16_t pixels[window_height][window_width];
+#include <math.h>
+enum { window_scale = 3, screen_base_width = 176, screen_base_height = 208,
+       screen_max_width = 640, screen_max_height = 480 };
+/* Guest screen in RGB565; sized once by screen_configure() before the guest starts. */
+static int window_width = screen_base_width, window_height = screen_base_height;
+static uint16_t *pixels;
+#define PIXEL(x, y) pixels[(size_t)(y) * (size_t)window_width + (size_t)(x)]
 static struct { uint32_t window, font, pen_color, pen_style, brush_color, brush_style, draw_pc; } gc;
 static int hold_first_frame;
+/* The presentation texture is the guest size times present_scale. The optional Vulkan scene pass
+   (tools/host_tris.h) can fill it alongside unmodified guest-drawn pixels. */
+static unsigned present_scale = 1;
+static unsigned host_scene_scale(void);
+static int host_scene_has_blit(void);
+static void host_scene_compose(uint32_t *out, const uint16_t *guest, unsigned width, unsigned height,
+                               unsigned scale, const uint32_t *lut);
 
 static uint32_t text_data(const uint32_t *stack, uint32_t desc, uint32_t *len) {
     uint32_t header = guest_read(stack, desc);
@@ -89,8 +101,8 @@ static int draw_rect(const uint32_t *stack, uint32_t rect) {
     uint16_t pen = rgb565(gc.pen_color), brush = rgb565(gc.brush_color);
     for (int y = y0 < 0 ? 0 : y0; y < y1 && y < window_height; y++)
         for (int x = x0 < 0 ? 0 : x0; x < x1 && x < window_width; x++) {
-            if (gc.pen_style && (x == x0 || x == x1-1 || y == y0 || y == y1-1)) pixels[y][x] = pen;
-            else if (gc.brush_style) pixels[y][x] = brush;
+            if (gc.pen_style && (x == x0 || x == x1-1 || y == y0 || y == y1-1)) PIXEL(x, y) = pen;
+            else if (gc.brush_style) PIXEL(x, y) = brush;
         }
     return 1;
 }
@@ -139,7 +151,7 @@ static int raster_text(const uint32_t *stack, uint32_t text, uint32_t point, uin
 
 static int draw_text(const uint32_t *stack, uint32_t text, uint32_t point, uint32_t pc) {
     return raster_text(stack, text, point, gc.font, gc.pen_color, (unsigned char *)pixels,
-                       window_width, window_height, sizeof pixels[0], pc);
+                       window_width, window_height, (unsigned)window_width * sizeof *pixels, pc);
 }
 
 /* Presentation is host-only: the guest still draws into the fixed 176x208
@@ -161,11 +173,12 @@ static int draw_text(const uint32_t *stack, uint32_t text, uint32_t point, uint3
    Vulkan loader: add $(pkg-config --libs vulkan) to the compile line
    (pkg-config sdl2 does not imply it). */
 typedef struct {
-    int window_width, window_height, highdpi, linear_filter;
+    int window_width, window_height, highdpi, linear_filter, colorspace_p3;
     const char *filter_name;
 } present_settings;
 
 enum { present_max_swapchain_images = 8, present_max_instance_extensions = 16 };
+enum { present_color_srgb_hw, present_color_srgb_encoded, present_color_display_p3 };
 
 static present_settings present;
 static int present_settings_loaded;
@@ -181,6 +194,8 @@ typedef struct {
     VkSwapchainKHR swapchain;
     VkFormat format;
     VkColorSpaceKHR color_space;
+    int color_mode;
+    VkFormat texture_format;
     VkExtent2D extent;
     uint32_t image_count;
     VkImage images[present_max_swapchain_images];
@@ -210,6 +225,46 @@ typedef struct {
 } present_vulkan;
 
 static present_vulkan vk_present;
+
+static uint32_t present_lut[65536];
+
+static const char *present_color_name(void) {
+    switch (vk_present.color_mode) {
+    case present_color_srgb_hw: return "sRGB(hardware-encoded)";
+    case present_color_display_p3: return "Display-P3";
+    default: return "sRGB(encoded)";
+    }
+}
+
+static float present_srgb_decode(float v) {
+    return v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f);
+}
+
+static float present_srgb_encode(float v) {
+    if (v <= 0.0f) return 0.0f;
+    if (v >= 1.0f) return 1.0f;
+    return v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+}
+
+/* RGB565 -> RGBA8 for the guest image. Channels expand by exact scaling (5 bit x/31, 6 bit x/63).
+   Display-P3 mode re-expresses the sRGB colour in P3 primaries (same transfer function). */
+static void present_build_lut(void) {
+    for (unsigned i = 0; i < 65536; i++) {
+        unsigned r = (i >> 11) & 31, g = (i >> 5) & 63, b = i & 31;
+        unsigned r8 = (r * 255 + 15) / 31, g8 = (g * 255 + 31) / 63, b8 = (b * 255 + 15) / 31;
+        if (vk_present.color_mode == present_color_display_p3) {
+            float lr = present_srgb_decode(r8 / 255.0f), lg = present_srgb_decode(g8 / 255.0f),
+                  lb = present_srgb_decode(b8 / 255.0f);
+            float pr = 0.8224621f * lr + 0.1775380f * lg;
+            float pg = 0.0331941f * lr + 0.9668058f * lg;
+            float pb = 0.0170827f * lr + 0.0723974f * lg + 0.9105199f * lb;
+            r8 = (unsigned)lrintf(present_srgb_encode(pr) * 255.0f);
+            g8 = (unsigned)lrintf(present_srgb_encode(pg) * 255.0f);
+            b8 = (unsigned)lrintf(present_srgb_encode(pb) * 255.0f);
+        }
+        present_lut[i] = r8 | (g8 << 8) | (b8 << 16) | UINT32_C(0xff000000);
+    }
+}
 
 static int present_word_is(const char *text, const char *word) {
     while (*text && *word) {
@@ -242,6 +297,39 @@ static int present_env_bool(const char *name, int fallback) {
         present_word_is(text, "false") || present_word_is(text, "no")) return 0;
     fprintf(stderr, "presentation: %s=\"%s\" is invalid (want 0|1), using %d\n", name, text, fallback);
     return fallback;
+}
+
+/* The guest screen is a runtime size. The original UI centres its 176x208 art inside any larger
+   screen and 3D uses the full viewport, so a wider screen is rendered by the guest itself;
+   nothing here changes game logic. ISLAND_SCREEN=native|WxH|A:B (default 16:9, height 208). */
+static void screen_configure(void) {
+    if (pixels) return;
+    int width = screen_base_width, height = screen_base_height;
+    const char *spec = getenv("ISLAND_SCREEN");
+    if (!spec || !*spec) spec = "16:9";
+    int a = 0, b = 0;
+    char tail = 0;
+    if (present_word_is(spec, "native")) {
+    } else if (sscanf(spec, "%dx%d%c", &a, &b, &tail) == 2 && a >= screen_base_width &&
+               a <= screen_max_width && b >= screen_base_height && b <= screen_max_height) {
+        width = a;
+        height = b;
+    } else if (sscanf(spec, "%d:%d%c", &a, &b, &tail) == 2 && a > 0 && b > 0) {
+        width = (int)(((int64_t)height * a + b / 2) / b);
+    } else {
+        fprintf(stderr, "presentation: ISLAND_SCREEN=\"%s\" is invalid (want native|WxH|A:B), using native\n", spec);
+    }
+    if (width < screen_base_width) width = screen_base_width;
+    if (width > screen_max_width) width = screen_max_width;
+    width &= ~1;
+    window_width = width;
+    window_height = height;
+    pixels = calloc((size_t)width * height, sizeof *pixels);
+    if (!pixels) {
+        fputs("guest screen: out of memory\n", stderr);
+        exit(1);
+    }
+    fprintf(stderr, "guest screen: %dx%d RGB565\n", width, height);
 }
 
 static void present_load_settings(void) {
@@ -277,6 +365,13 @@ static void present_load_settings(void) {
         } else if (!present_word_is(filter, "nearest") && !present_word_is(filter, "0")) {
             fprintf(stderr, "presentation: ISLAND_PRESENT_FILTER=\"%s\" is invalid (want nearest|linear), using nearest\n", filter);
         }
+    }
+    present.colorspace_p3 = 0;
+    const char *space = getenv("ISLAND_COLORSPACE");
+    if (space && *space) {
+        if (present_word_is(space, "p3") || present_word_is(space, "display-p3")) present.colorspace_p3 = 1;
+        else if (!present_word_is(space, "srgb") && !present_word_is(space, "auto"))
+            fprintf(stderr, "presentation: ISLAND_COLORSPACE=\"%s\" is invalid (want srgb|p3|auto), using srgb\n", space);
     }
 }
 
@@ -387,6 +482,20 @@ static int present_create_instance(void) {
     const char *extensions[present_max_instance_extensions];
     if (!SDL_Vulkan_GetInstanceExtensions(present_window, &count, extensions))
         return present_sdl_fail("SDL_Vulkan_GetInstanceExtensions");
+    /* VK_EXT_swapchain_colorspace lists non-sRGB surface colour spaces such as Display-P3. */
+    uint32_t available = 0;
+    if (vkEnumerateInstanceExtensionProperties(NULL, &available, NULL) == VK_SUCCESS && available) {
+        VkExtensionProperties properties[256];
+        if (available > 256) available = 256;
+        VkResult listed = vkEnumerateInstanceExtensionProperties(NULL, &available, properties);
+        if (listed == VK_SUCCESS || listed == VK_INCOMPLETE)
+            for (uint32_t i = 0; i < available && i < 256; i++)
+                if (!strcmp(properties[i].extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) &&
+                    count < (unsigned)present_max_instance_extensions) {
+                    extensions[count++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+                    break;
+                }
+    }
     VkApplicationInfo application = {0};
     application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     application.pApplicationName = "Lament Island — AOT";
@@ -480,6 +589,13 @@ static int present_create_device(void) {
     return 1;
 }
 
+/* The guest frame is sRGB-encoded RGB565 (a handset LCD). Pick the swapchain so the
+   compositor and the display see the right primaries and transfer function:
+   - sRGB_NONLINEAR + *_SRGB format: the sampler decodes the guest image, the swapchain
+     re-encodes it, so linear filtering blends in linear light.
+   - sRGB_NONLINEAR + UNORM: guest values are written as already-encoded sRGB.
+   - Display-P3 (ISLAND_COLORSPACE=p3, when the surface advertises it): the LUT converts
+     sRGB primaries to P3 so colours are not over-saturated on a wide-gamut surface. */
 static int present_choose_format(void) {
     uint32_t count = 0;
     if (!present_vk_check(vkGetPhysicalDeviceSurfaceFormatsKHR(vk_present.physical, vk_present.surface,
@@ -497,15 +613,40 @@ static int present_choose_format(void) {
     if (result != VK_SUCCESS && result != VK_INCOMPLETE)
         return present_vk_check(result, "vkGetPhysicalDeviceSurfaceFormatsKHR");
     if (count > 64) count = 64;
-    vk_present.format = formats[0].format;
-    vk_present.color_space = formats[0].colorSpace;
-    for (uint32_t i = 0; i < count; i++)
-        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM &&
-            formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            vk_present.format = formats[i].format;
-            vk_present.color_space = formats[i].colorSpace;
-            break;
+    int best = -1, mode = present_color_srgb_encoded;
+    if (present.colorspace_p3)
+        for (uint32_t i = 0; i < count && best < 0; i++)
+            if (formats[i].colorSpace == VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT &&
+                (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM ||
+                 formats[i].format == VK_FORMAT_R8G8B8A8_UNORM)) {
+                best = (int)i;
+                mode = present_color_display_p3;
+            }
+    if (present.colorspace_p3 && best < 0)
+        fprintf(stderr, "presentation: surface does not advertise Display-P3; using sRGB\n");
+    for (uint32_t i = 0; i < count && best < 0; i++)
+        if (formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR &&
+            (formats[i].format == VK_FORMAT_B8G8R8A8_SRGB ||
+             formats[i].format == VK_FORMAT_R8G8B8A8_SRGB)) {
+            best = (int)i;
+            mode = present_color_srgb_hw;
         }
+    for (uint32_t i = 0; i < count && best < 0; i++)
+        if (formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR &&
+            (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM ||
+             formats[i].format == VK_FORMAT_R8G8B8A8_UNORM)) {
+            best = (int)i;
+            mode = present_color_srgb_encoded;
+        }
+    if (best < 0) {
+        fprintf(stderr, "presentation: no 8-bit sRGB surface format; using format %d as sRGB-encoded\n",
+                (int)formats[0].format);
+        best = 0;
+    }
+    vk_present.format = formats[best].format;
+    vk_present.color_space = formats[best].colorSpace;
+    vk_present.color_mode = mode;
+    present_build_lut();
     return 1;
 }
 
@@ -780,18 +921,21 @@ static int present_recreate_swapchain(void) {
 
 static int present_create_texture(void) {
     VkFormatProperties properties;
-    vkGetPhysicalDeviceFormatProperties(vk_present.physical, VK_FORMAT_R5G6B5_UNORM_PACK16, &properties);
+    vk_present.texture_format = vk_present.color_mode == present_color_srgb_hw
+                                    ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    vkGetPhysicalDeviceFormatProperties(vk_present.physical, vk_present.texture_format, &properties);
     if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ||
         !(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT)) {
-        fprintf(stderr, "presentation: vulkan: VK_FORMAT_R5G6B5_UNORM_PACK16 cannot be sampled and uploaded\n");
+        fprintf(stderr, "presentation: vulkan: guest image format %d cannot be sampled and uploaded\n",
+                (int)vk_present.texture_format);
         return 0;
     }
     VkImageCreateInfo image = {0};
     image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     image.imageType = VK_IMAGE_TYPE_2D;
-    image.format = VK_FORMAT_R5G6B5_UNORM_PACK16;
-    image.extent.width = window_width;
-    image.extent.height = window_height;
+    image.format = vk_present.texture_format;
+    image.extent.width = (uint32_t)window_width * present_scale;
+    image.extent.height = (uint32_t)window_height * present_scale;
     image.extent.depth = 1;
     image.mipLevels = 1;
     image.arrayLayers = 1;
@@ -825,7 +969,7 @@ static int present_create_texture(void) {
     view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view.image = vk_present.texture;
     view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = VK_FORMAT_R5G6B5_UNORM_PACK16;
+    view.format = vk_present.texture_format;
     view.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
     view.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
     view.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
@@ -838,7 +982,7 @@ static int present_create_texture(void) {
         return 0;
     vk_present.texture_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    vk_present.staging_size = (VkDeviceSize)window_width * window_height * sizeof pixels[0][0];
+    vk_present.staging_size = (VkDeviceSize)window_width * window_height * present_scale * present_scale * sizeof(uint32_t);
     VkBufferCreateInfo buffer = {0};
     buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer.size = vk_present.staging_size;
@@ -968,6 +1112,7 @@ static int present_create(void) {
     if (!present_create_render_pass()) return 0;
     if (!present_create_pipeline()) return 0;
     if (!present_create_swapchain()) return 0;
+    present_scale = host_scene_scale();
     if (!present_create_texture()) return 0;
     if (!present_create_sampler()) return 0;
     if (!present_create_descriptor()) return 0;
@@ -983,11 +1128,12 @@ static void present_log_settings(void) {
     SDL_Vulkan_GetDrawableSize(present_window, &drawable_width, &drawable_height);
     fprintf(stderr,
             "presentation: window=%dx%d drawable=%dx%d swapchain=%ux%u requested=%dx%d highdpi=%d "
-            "filter=%s format=%d present_mode=fifo device=%s\n",
+            "filter=%s format=%d colorspace=%s guest=%dx%d present_mode=fifo device=%s\n",
             window_width_now, window_height_now, drawable_width, drawable_height,
             vk_present.extent.width, vk_present.extent.height,
             present.window_width, present.window_height, present.highdpi,
-            present.filter_name, (int)vk_present.format, properties.deviceName);
+            present.filter_name, (int)vk_present.format, present_color_name(),
+            window_width, window_height, properties.deviceName);
 }
 
 static void present_destination(int width, int height, int *x, int *y, int *w, int *h) {
@@ -1036,10 +1182,18 @@ static int present_frame(void) {
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (!present_vk_check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer")) return 0;
-    memcpy(vk_present.staging_data, pixels, (size_t)vk_present.staging_size);
+    {
+        /* Guest RGB565 goes through the colour LUT while it is copied into staging. */
+        uint32_t *out = vk_present.staging_data;
+        if (present_scale > 1 || host_scene_has_blit())
+            host_scene_compose(out, pixels, (unsigned)window_width, (unsigned)window_height, present_scale, present_lut);
+        else
+            for (size_t i = 0, n = (size_t)window_width * window_height; i < n; i++)
+                out[i] = present_lut[pixels[i]];
+    }
 
-    /* Reuse the guest image: every frame uploads the 176x208 RGB565 surface
-       through the host-visible staging buffer, then samples it. */
+    /* Reuse the guest image: every frame converts the RGB565 surface into the
+       host-visible staging buffer, uploads it, then samples it. */
     VkImageMemoryBarrier barrier = {0};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1061,8 +1215,8 @@ static int present_frame(void) {
     VkBufferImageCopy copy = {0};
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.imageSubresource.layerCount = 1;
-    copy.imageExtent.width = window_width;
-    copy.imageExtent.height = window_height;
+    copy.imageExtent.width = (uint32_t)window_width * present_scale;
+    copy.imageExtent.height = (uint32_t)window_height * present_scale;
     copy.imageExtent.depth = 1;
     vkCmdCopyBufferToImage(command, vk_present.staging_buffer, vk_present.texture,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
@@ -1153,6 +1307,7 @@ static int present_frame(void) {
     return 1;
 }
 
+static void debug_frame_presented(void); /* tools/pc_debug.h */
 static int publish_window(uint32_t pc) {
     if (!gc.draw_pc) return 1;
     if (!present_window) {
@@ -1161,12 +1316,12 @@ static int publish_window(uint32_t pc) {
         present_log_settings();
     }
     if (!present_frame()) goto error;
+    debug_frame_presented();
     uint32_t hash = UINT32_C(2166136261);
-    for (unsigned y = 0; y < window_height; y++)
-        for (unsigned x = 0; x < window_width; x++) {
-            hash = (hash ^ (pixels[y][x] & 255u)) * UINT32_C(16777619);
-            hash = (hash ^ (pixels[y][x] >> 8)) * UINT32_C(16777619);
-        }
+    for (size_t i = 0; i < (size_t)window_width * window_height; i++) {
+        hash = (hash ^ (pixels[i] & 255u)) * UINT32_C(16777619);
+        hash = (hash ^ (pixels[i] >> 8)) * UINT32_C(16777619);
+    }
     fprintf(stderr, "guest frame: draw=%08x present=%08x RGB565 FNV-1a=%08x\n", gc.draw_pc, pc, hash);
     if (hold_first_frame) {
         SDL_Event event;

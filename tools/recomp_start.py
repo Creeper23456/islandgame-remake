@@ -261,6 +261,40 @@ ESTOR_OPS = {
 ARM_CONDITIONS = {0: 'z', 1: '!z', 2: 'c', 3: '!c', 4: 'n', 5: '!n', 6: 'v', 7: '!v', 8: 'c && !z',
                   9: '!c || z', 10: 'n == v', 11: 'n != v', 12: '!z && n == v', 13: 'z || n != v', 14: None}
 
+# Debug-only (`--trace`) hooks before individual ARM instructions; see tools/pc_trace.h. The renderer vtable
+# slots 0x83fa8/0x85bb0, FUN_0007f854/0x7d8ac/0x76ad4 are the per-triangle rasterizers.
+TRACE_ENTRY_HOOKS = {
+    0x63194: 'trace_frame_begin(stack, r);',
+    # GameSceneCompositeFrame: return PC of BL DrawSceneGeometry, before even testing player+0x5eb.
+    0x68ebc: 'trace_frame_end(stack, r[10]);',  # r10 preserves the caller's session argument
+    0x5d970: 'trace_player_tick(stack, r);',
+    0x83fa8: 'trace_raster(stack, r, 0);',
+    0x85bb0: 'trace_raster(stack, r, 6);',
+    0x7f854: 'trace_raster(stack, r, 5);',
+    0x7d8ac: 'trace_raster(stack, r, 4);',
+    0x76ad4: 'trace_raster(stack, r, 1);',
+    0x711f0: 'trace_project(stack, r);',
+}
+
+# Always-on host hooks at the same entry points (tools/host_tris.h); each is a no-op unless enabled.
+# 0x68ebc is the return PC of BL DrawSceneGeometry in GameSceneCompositeFrame (r10 keeps the session).
+HOST_ENTRY_HOOKS = {
+    0x63194: 'host_tris_begin(r);',
+    0x68ebc: 'host_tris_end(stack, r[10]);',
+    0x68f80: 'host_scene_alpha(stack, r[10]);',  # immediately after guest alpha, before HUD
+    0x711f0: 'host_tris_project(stack, r);',  # pre-projection camera-space batch (opt-in)
+    0x70e44: 'host_tris_plan_forward(stack, r);',  # validate and optionally render before forward raster dispatch
+    0x83fa8: 'host_tris_push(stack, r, 0);',
+    0x85bb0: 'host_tris_push(stack, r, 6);',
+    0x7f854: 'host_tris_push(stack, r, 5);',
+    0x7d8ac: 'host_tris_push(stack, r, 4);',
+    0x76ad4: 'host_tris_push(stack, r, 1);',
+    # Preserve each kernel's signed-area scratch write and restore its real AOT frame.
+    0x84028: 'if (!z && n == v && host_scene_skip_raster()) goto pc_000845ec;',
+    0x76b54: 'if (!z && n == v && host_scene_skip_raster()) goto pc_00077048;',
+    0x85c30: 'if (!z && n == v && host_scene_skip_raster()) goto pc_00086260;',
+}
+
 
 def label(pc):
     return f'pc_{pc:08x}'
@@ -271,7 +305,7 @@ def arm_immediate(word):
     return ((imm >> rotate) | (imm << (32 - rotate))) & 0xffffffff
 
 
-def lift(image, entry, reason, attach=False, game_dlls=()):
+def lift(image, entry, reason, attach=False, game_dlls=(), trace=False):
     pending, blocks = [entry], {}
     modules = (image, *(dll for _, dll in game_dlls))
     for i, a in enumerate(modules):
@@ -353,6 +387,20 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
         # menu logic and descriptor, but hand off to the desktop browser instead.
         if app_profile and module is image and encoded == 0x6b49c and image.load(pc) == 0xe1a0c00d:
             blocks[encoded] = ['open_official_website(stack, r[1]);', 'target = r[14]; goto dispatch;']
+            continue
+        # SetViewportWithOffset (0x6eb74) computes the projection scale from min(width, height) at
+        # `mov r3, r3, lsl #7`; r4 points at the {width, height} pair.
+        if app_profile and module is image and encoded == 0x6ebb8 and image.load(pc) == 0xe1a03383:
+            blocks[encoded] = ['r[3] = viewport_projection_extent(stack, r[4], r[3]) << 7;', jump(encoded + 4)]
+            continue
+        # FUN_00038e80 draws the in-scene HUD (HP frame, bullet count, softkey labels) and has no
+        # other effect. hud_layout.h reimplements it with a widescreen layout; check that the
+        # constants it assumes ("*%d%d" count format, divide-by-5 HP scale) are still what the game has.
+        if app_profile and module is image and encoded == 0x38e80 and image.load(pc) == 0xe1a0c00d:
+            fmt = image.load(0x39190) - image.base
+            if image.load(0x3918c) != 0x66666667 or bytes(image.code[fmt:fmt + 6]) != b'*%d%d\0':
+                raise ValueError('unexpected HUD constants at 0x3918c/0x39190')
+            blocks[encoded] = ['hud_draw(stack, r[0]);', 'target = r[14]; goto dispatch;']
             continue
         w = module.load(pc, width)
         next_pc = encoded + width
@@ -834,8 +882,10 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                        'guest_write(stack, r[0] + 4, 1);',
                        'while (guest_read(stack, r[0] + 4)) {',
                        '    uint32_t argument = 0, event = 0;',
-                       '    if (!next_timer_event(stack, &argument, &event)) return unsupported(r[14], 0);',
-                       '    if (!run_nested_event(stack, event, argument, r[13])) return unsupported(r[14], 0);',
+                       '    if (!current_worker) { int status = threads_run_ready(stack); if (status) return status; }',
+                       '    int pending = next_timer_event(stack, &argument, &event);',
+                       '    if (!pending) return unsupported(r[14], 0);',
+                       '    if (pending == 1 && !run_nested_event(stack, event, argument, r[13])) return unsupported(r[14], 0);',
                        '}',
                        'target = r[14]; goto dispatch;']
             elif app_profile and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 947):
@@ -1275,6 +1325,18 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             ops = [f'return unsupported({encoded:#x}, {w:#x});']
         if predicate:
             ops = [f'if (!({predicate})) {{ {jump(next_pc)} }}', *ops]
+        if app_profile and module is image and encoded == 0x5d970 and image.load(pc) == 0xe1a0c00d:
+            # UpdatePlayer runs only while the player can act; the host uses that to decide when
+            # mouse look may capture the pointer and applies the gathered yaw here.
+            ops = ['pc_note_gameplay();', 'pc_look_apply(stack, r[0]);', *ops]
+        if trace and app_profile and module is image and not thumb:
+            hook = TRACE_ENTRY_HOOKS.get(encoded)
+            if hook:
+                ops = [hook, *ops]
+        if app_profile and module is image and not thumb:
+            hook = HOST_ENTRY_HOOKS.get(encoded)
+            if hook:
+                ops = [hook, *ops]
         if not ops:
             raise ValueError(f'unsupported instruction at {encoded:#x}: {w:#x}')
         blocks[encoded] = ops
@@ -1362,7 +1424,8 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                   '    case 0xff000030:',
                   '        { int status = pump_window_input(stack, r[13]); if (status) return status < 0 ? 0 : status; }',
                   '        { int status = threads_run_ready(stack); if (status) return status; }',
-                  '        if (!next_timer_event(stack, &r[0], &target)) return 3;',
+                  '        { int pending = next_timer_event(stack, &r[0], &target); if (!pending) return 3;',
+                  '          if (pending == 2) { target = 0xff000030; goto dispatch; } }',
                   '        r[14] = 0xff000030; goto dispatch;']
     elif calls_factory:
         lines += ['    case 0xff000010: return finish_factory(stack, r[0]);']
@@ -1812,6 +1875,12 @@ static unsigned capture_count;
 {(Path(__file__).with_name('guest_threads.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('guest_sync.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('guest_audio.h').read_text() if app_profile else '')}
+{(Path(__file__).with_name('hud_layout.h').read_text() if app_profile else '')}
+{(Path(__file__).with_name('pc_debug.h').read_text() if app_profile else '')}
+{(Path(__file__).with_name('vk_scene_spirv.h').read_text() if app_profile else '')}
+{(Path(__file__).with_name('vk_scene.h').read_text() if app_profile else '')}
+{(Path(__file__).with_name('host_tris.h').read_text() if app_profile else '')}
+{(Path(__file__).with_name('pc_trace.h').read_text() if app_profile and trace else '')}
 
 #if {int(bool(app_profile))}
 static int window_gc(uint32_t *stack, uint32_t slot, uint32_t context, uint32_t arg, uint32_t point, uint32_t pc) {{
@@ -1826,8 +1895,9 @@ static int window_gc(uint32_t *stack, uint32_t slot, uint32_t context, uint32_t 
     case 0xac: return draw_text(stack, arg, point, pc);
     case 0xe4: {{ /* CWindowGc::BitBlt(const TPoint&, const CFbsBitmap*) */
         const struct fbs_bitmap_entry *bitmap = fbs_bitmap_find(point);
-        if (!bitmap || bitmap->mode != FBS_EColor64K) return 0;
+        if (!bitmap || bitmap->mode != FBS_EColor64K) {{ host_scene_invalidate(); return 0; }}
         int64_t left = (int32_t)guest_read(stack, arg), top = (int32_t)guest_read(stack, arg + 4);
+        host_scene_blit(pc, point, bitmap->data, bitmap->width, bitmap->height, bitmap->stride, left, top);
         unsigned changed = 0;
         for (int y = 0; y < window_height; y++) {{
             int64_t sy = y - top;
@@ -1837,13 +1907,17 @@ static int window_gc(uint32_t *stack, uint32_t slot, uint32_t context, uint32_t 
                 int64_t sx = x - left;
                 if (sx < 0 || sx >= bitmap->width) continue;
                 uint16_t value = guest_read_small(stack, row + (uint32_t)sx * 2, 2);
-                changed += pixels[y][x] != value;
-                pixels[y][x] = value;
+                changed += PIXEL(x, y) != value;
+                PIXEL(x, y) = value;
             }}
         }}
         if (changed) {{
             gc.draw_pc = pc;
             fprintf(stderr, "guest BitBlt pc=%08x changed_pixels=%u\\n", pc, changed);
+        }}
+        else if (host_scene_has_blit()) {{
+            /* The higher-resolution scene can change while the guest bitmap stays identical. */
+            gc.draw_pc = pc;
         }}
         break;
     }}
@@ -1851,7 +1925,12 @@ static int window_gc(uint32_t *stack, uint32_t slot, uint32_t context, uint32_t 
         if (arg != framework.window || gc.window) return 0;
         gc.window = arg;
         break;
-    case 0x114: gc.window = 0; return publish_window(pc);
+    case 0x114: {{
+        gc.window = 0;
+        int ok = publish_window(pc);
+        host_scene_invalidate(); /* Also consume the match if presentation skipped composition. */
+        return ok;
+    }}
     default: return 0;
     }}
     return 1;
@@ -2137,10 +2216,12 @@ static int base_construct_appui(uint32_t *stack, uint32_t appui, uint32_t flags)
     framework.cba_id = le32(info + 16);
     framework.control_stack = heap_alloc_zeroed(4); /* Host-owned CONE control stack. */
     guest_write(stack, appui + 12, framework.control_stack);
-    /* The original app has a 176x208 content path (also used as a viewport
-       of its 352x416 mode). Expose the former as the standalone device. */
-    framework.screen_rect[2] = 176;
-    framework.screen_rect[3] = 208;
+    /* The original app lays out for any screen at least 176x208: 3D and the in-scene HUD use the
+       full viewport, and menus centre their 176x208 art. screen_configure() picks the size
+       (default 16:9 at 208 rows; ISLAND_SCREEN=native restores 176x208). */
+    screen_configure();
+    framework.screen_rect[2] = (uint32_t)window_width;
+    framework.screen_rect[3] = (uint32_t)window_height;
     framework.screen_device = heap_alloc_zeroed(8);
     uint32_t screen_vtable = heap_alloc_zeroed(16);
     guest_write(stack, screen_vtable + 12, SCREEN_DISPLAY_MODE);
@@ -2525,6 +2606,7 @@ static int pc_scancode_reserved(uint32_t scancode) {{
     switch (scancode) {{
     case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_ESCAPE:
     case SDL_SCANCODE_SPACE: case SDL_SCANCODE_RSHIFT:
+    case SDL_SCANCODE_W: case SDL_SCANCODE_A: case SDL_SCANCODE_S: case SDL_SCANCODE_D:
     case SDL_SCANCODE_LEFT: case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_UP: case SDL_SCANCODE_DOWN:
     case SDL_SCANCODE_KP_1: case SDL_SCANCODE_KP_2: case SDL_SCANCODE_KP_3:
     case SDL_SCANCODE_KP_4: case SDL_SCANCODE_KP_5: case SDL_SCANCODE_KP_6:
@@ -2679,18 +2761,101 @@ static int pc_send_key(uint32_t *stack, uint32_t sp, uint32_t scan, uint32_t typ
     return guest_run(&nested, stack);
 }}
 
-/* Map a window-pixel pointer position into the 176x208 logical frame. The game window owns only
-   the frame lease here; no pointer coordinates are written into guest memory. */
+/* The 3D projection scale is derived from min(width, height) of the viewport. For a screen wider
+   than 176x208 that would zoom the picture in; keep the scale the original 176x208 view had
+   (176 per 208 rows) so the centre of the picture is unchanged and the extra width shows more
+   of the scene. Only the main screen viewport is adjusted (other viewports keep their own). */
+static uint32_t viewport_projection_extent(uint32_t *stack, uint32_t dims, uint32_t extent) {{
+    uint32_t w = guest_read(stack, dims), h = guest_read(stack, dims + 4);
+    if (w != (uint32_t)window_width || h != (uint32_t)window_height) return extent;
+    uint32_t reference = (uint32_t)((uint64_t)h * screen_base_width / screen_base_height);
+    return extent < reference ? extent : reference;
+}}
+
+/* Map a window-point pointer position into guest screen pixels: window points -> drawable pixels
+   -> the letterboxed destination rectangle -> guest pixels. No pointer coordinates are written into
+   guest memory. */
 static void pc_logical_point(uint32_t window_id, int wx, int wy, int32_t *x, int32_t *y) {{
-    int ww = window_width, wh = window_height;
+    int ww = 0, wh = 0, dw = 0, dh = 0;
     SDL_Window *window = SDL_GetWindowFromID(window_id);
-    if (window) SDL_GetWindowSize(window, &ww, &wh);
-    if (ww <= 0) ww = window_width;
-    if (wh <= 0) wh = window_height;
-    int32_t lx = (int32_t)((int64_t)wx * window_width / ww);
-    int32_t ly = (int32_t)((int64_t)wy * window_height / wh);
+    if (window) {{
+        SDL_GetWindowSize(window, &ww, &wh);
+        SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+    }}
+    if (ww <= 0 || wh <= 0 || dw <= 0 || dh <= 0) {{
+        ww = dw = window_width;
+        wh = dh = window_height;
+    }}
+    int rx, ry, rw, rh;
+    present_destination(dw, dh, &rx, &ry, &rw, &rh);
+    int64_t px = (int64_t)wx * dw / ww - rx, py = (int64_t)wy * dh / wh - ry;
+    int32_t lx = (int32_t)(px * window_width / rw);
+    int32_t ly = (int32_t)(py * window_height / rh);
     *x = lx < 0 ? 0 : lx >= window_width ? window_width - 1 : lx;
     *y = ly < 0 ? 0 : ly >= window_height ? window_height - 1 : ly;
+}}
+
+/* Mouse look. Relative mouse motion turns the player's heading (player+0x278, 12-bit angle, 0x1000
+   = 360 degrees) in exact units, applied at UpdatePlayer entry on the guest thread, so the turn is
+   not quantised to the guest's key-driven ramp. Position, collision, camera, animation and scripts
+   stay on the original path; the camera is derived from the same heading every frame. The pointer
+   is captured (relative mode) only while UpdatePlayer is running, i.e. while the player can act;
+   menus, dialogue, maps and the pause menu keep the normal pointer. ISLAND_MOUSE_LOOK=0 disables it,
+   ISLAND_MOUSE_STEP=<mouse counts per full turn> sets the sensitivity (200..20000, default 2000),
+   ISLAND_MOUSE_INVERT=1 flips the direction. */
+static uint64_t pc_gameplay_us;
+static int64_t pc_look_pending, pc_look_rest;
+static int pc_look_captured, pc_look_configured, pc_look_enabled = 1, pc_look_step = 2000, pc_look_invert;
+
+static uint64_t pc_clock_us(void) {{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000 + (uint64_t)now.tv_nsec / 1000;
+}}
+
+static void pc_note_gameplay(void) {{ pc_gameplay_us = pc_clock_us(); }}
+
+static void pc_look_configure(void) {{
+    pc_look_configured = 1;
+    const char *text = getenv("ISLAND_MOUSE_LOOK");
+    if (text && (!strcmp(text, "0") || !strcmp(text, "off"))) pc_look_enabled = 0;
+    text = getenv("ISLAND_MOUSE_STEP");
+    if (text && *text) {{
+        char *end = NULL;
+        long value = strtol(text, &end, 10);
+        if (!*end && value >= 200 && value <= 20000) pc_look_step = (int)value;
+        else fprintf(stderr, "pc-input: ISLAND_MOUSE_STEP=%s is invalid (want 200..20000), using %d\\n", text, pc_look_step);
+    }}
+    text = getenv("ISLAND_MOUSE_INVERT");
+    if (text && (!strcmp(text, "1") || !strcmp(text, "on"))) pc_look_invert = 1;
+    fprintf(stderr, "pc-input: mouse look %s counts-per-turn=%d invert=%d\\n", pc_look_enabled ? "on" : "off",
+            pc_look_step, pc_look_invert);
+}}
+
+static void pc_look_update(void) {{
+    if (!pc_look_configured) pc_look_configure();
+    int active = pc_look_enabled && pc_gameplay_us && pc_clock_us() - pc_gameplay_us < 250000 &&
+                 SDL_GetKeyboardFocus() != NULL;
+    if (active != pc_look_captured) {{
+        SDL_SetRelativeMouseMode(active ? SDL_TRUE : SDL_FALSE);
+        pc_look_captured = active;
+        pc_look_pending = pc_look_rest = 0;
+    }}
+}}
+
+/* Called at UpdatePlayer entry (r0 = session): turn the player by the mouse motion gathered since
+   the previous guest update. Moving right lowers the heading, like the original Right key. */
+static void pc_look_apply(uint32_t *stack, uint32_t session) {{
+    if (!pc_look_captured || !pc_look_pending) return;
+    int64_t scaled = pc_look_pending * 4096 + pc_look_rest;
+    int64_t units = scaled / pc_look_step;
+    pc_look_rest = scaled % pc_look_step;
+    pc_look_pending = 0;
+    if (!units) return;
+    uint32_t player = guest_read(stack, session + 0x2cc);
+    if (!player) return;
+    uint32_t heading = guest_read(stack, player + 0x278);
+    guest_write(stack, player + 0x278, (heading - (uint32_t)units) & 0xfff);
 }}
 
 /* Deliver one SDL transition per scheduler pass so a short tap reaches the guest update. Only
@@ -2699,6 +2864,19 @@ static void pc_logical_point(uint32_t window_id, int wx, int wy, int32_t *x, int
 static int pump_window_input(uint32_t *stack, uint32_t sp) {{
     if (!framework.control || !SDL_WasInit(SDL_INIT_VIDEO)) return 0;
     if (!pc_input_configured) pc_input_configure();
+    pc_look_update();
+    {{
+        int32_t dx;
+        if (debug_next_mouse(&dx) && pc_look_captured) pc_look_pending += dx;
+    }}
+    {{
+        uint32_t scan, type;
+        int tap;
+        while (debug_next_key(&scan, &type, &tap)) {{
+            if (tap) (void)pc_queue_tap(scan);
+            else (void)pc_queue_key_force(scan, type);
+        }}
+    }}
 
     /* Host-generated transitions (a click becomes an OK tap, Tab becomes the items softkey) are
        delivered one per scheduler pass, like physical key transitions. */
@@ -2725,6 +2903,10 @@ static int pump_window_input(uint32_t *stack, uint32_t sp) {{
             continue;
         }}
         if (event.type == SDL_MOUSEMOTION) {{
+            if (pc_look_captured) {{
+                pc_look_pending += event.motion.xrel * (pc_look_invert ? -1 : 1);
+                continue;
+            }}
             int32_t x, y;
             pc_logical_point(event.motion.windowID, event.motion.x, event.motion.y, &x, &y);
             pc_pointer_x = x;
@@ -2820,6 +3002,11 @@ static int pump_window_input(uint32_t *stack, uint32_t sp) {{
         case SDL_SCANCODE_RIGHT:  scan = 0x0f; break;
         case SDL_SCANCODE_UP:     scan = 0x10; break;
         case SDL_SCANCODE_DOWN:   scan = 0x11; break;
+        /* WASD are the same original direction keys as the arrows (W/S walk, A/D turn). */
+        case SDL_SCANCODE_A: scan = 0x0e; break;
+        case SDL_SCANCODE_D: scan = 0x0f; break;
+        case SDL_SCANCODE_W: scan = 0x10; break;
+        case SDL_SCANCODE_S: scan = 0x11; break;
         case SDL_SCANCODE_KP_7: scan = '1'; break;
         case SDL_SCANCODE_KP_8: scan = '2'; break;
         case SDL_SCANCODE_KP_9: scan = '3'; break;
@@ -2831,6 +3018,17 @@ static int pump_window_input(uint32_t *stack, uint32_t sp) {{
         case SDL_SCANCODE_KP_3: scan = '9'; break;
         case SDL_SCANCODE_PAGEUP:   scan = 0x7f; break; /* # */
         case SDL_SCANCODE_PAGEDOWN: scan = 0x85; break; /* * */
+        /* Main-row digits are the phone digits; the keypad keeps its dial-pad layout above. */
+        case SDL_SCANCODE_1: scan = '1'; break;
+        case SDL_SCANCODE_2: scan = '2'; break;
+        case SDL_SCANCODE_3: scan = '3'; break;
+        case SDL_SCANCODE_4: scan = '4'; break;
+        case SDL_SCANCODE_5: scan = '5'; break;
+        case SDL_SCANCODE_6: scan = '6'; break;
+        case SDL_SCANCODE_7: scan = '7'; break;
+        case SDL_SCANCODE_8: scan = '8'; break;
+        case SDL_SCANCODE_9: scan = '9'; break;
+        case SDL_SCANCODE_0: scan = '0'; break;
         default: continue;
         }}
         uint32_t type = event.type == SDL_KEYDOWN ? 3 : 2; /* EEventKeyDown/Up */
@@ -3005,6 +3203,15 @@ static int next_timer_event(uint32_t *stack, uint32_t *argument, uint32_t *targe
                 *target = guest_read(stack, guest_read(stack, object) + 16);
             }}
             return 1;
+        }}
+        {{
+            /* The mixer must get a scheduler pass before the device queue runs dry, even when no game
+               timer is due: report 2 so the caller services worker threads and calls again. */
+            uint64_t audio_at = audio_wake_us(us);
+            if (audio_at != UINT64_MAX) {{
+                if (audio_at <= us) {{ audio.last_wake_us = us; return 2; }}
+                if (audio_at < earliest) earliest = audio_at;
+            }}
         }}
         if (earliest == UINT64_MAX) {{ fputs("no pending timer events\\n", stderr); return 0; }}
         struct timespec wake = {{ .tv_sec = earliest / 1000000, .tv_nsec = earliest % 1000000 * 1000 }};
@@ -3267,6 +3474,7 @@ if __name__ == '__main__':
     parser.add_argument('--attach', action='store_true', help='probe a DLL process-attach entry in isolation')
     parser.add_argument('--base', type=lambda v: int(v, 0), help='guest code base')
     parser.add_argument('--game-dlls', type=Path, metavar='DIR', help='compile both local game DLLs into the EXE build')
+    parser.add_argument('--trace', action='store_true', help='compile in debug-only guest entry tracing (tools/pc_trace.h)')
     args = parser.parse_args()
     image = Image(args.image.read_bytes(), args.base)
     dlls = []
@@ -3279,4 +3487,4 @@ if __name__ == '__main__':
             if dll.u32(8) != uid or any(dll.u32(offset) for offset in (0x34, 0x44)):
                 raise ValueError(f'unexpected DLL UID or writable image segments: {name}')
             dlls.append((name, dll))
-    args.output.write_text(lift(image, image.entry, args.reason, args.attach, dlls))
+    args.output.write_text(lift(image, image.entry, args.reason, args.attach, dlls, args.trace))

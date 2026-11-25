@@ -3,6 +3,9 @@
 1. `tools/extract_e32.py` 从本地原版 ZIP 内的 SIS 提取 `IsLand_3rd.exe`、`SimMediaEngineDll.dll` 和 `SimDeviceEngineDll.dll`，并按开关把应用资源和初始存档写入本地安装盘。
 2. `tools/recomp_start.py` 读取 E32 重定位与导入，从原 `_E32Startup` 等入口遍历 ARM/Thumb 代码，生成包含原游戏模块和宿主 ABI 的 C；Clang 把它编译为桌面机器码。原游戏状态机驱动启动、开局影片、脚本和场景。EKA2L1 只供查阅接口与设计，不参与构建或运行。
 3. `tools/*.h` 提供宿主文件、位图、窗口、线程、同步和音频等接口。SDL2 接收键盘事件并输出原游戏绘制的 RGB565 帧和解码出的 PCM。原菜单「访问官网」把原游戏提供的 URL 交给 `SDL_OpenURL`；手测游戏无需选择该项。
+4. 画面：客户机屏幕尺寸是运行时值（`tools/window_gc.h` 的 `screen_configure`，默认 16:9×208 行），原游戏按视口尺寸分配缓冲并居中其 176×208 菜单画面。`SetViewportWithOffset`（`0x6eb74`）的投影缩放被固定为原 176×208 的比例，使画面中心不放大、两侧多出视野。`FUN_00038e80`（场景 HUD）由 `tools/hud_layout.h` 用原位图按新布局重绘，其余绘制仍由原代码完成。`guest frame` 的 FNV 哈希只在 `ISLAND_SCREEN=native` 时等于 `039c1b3e`。
+5. 色彩：宿主把 RGB565 经 65536 项查表转换成 RGBA8 再用暂存缓冲上传；`ISLAND_COLORSPACE` 选择 sRGB（硬件编码，线性过滤在线性光下进行）或 Display-P3。
+6. 音频：宿主为 SDL 队列保持约 150 ms 的预读，减小慢帧造成的欠载；欠载会在日志中输出 `audio: underrun`。
 
 ## 诊断
 
