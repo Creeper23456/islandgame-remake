@@ -1,8 +1,10 @@
 /* Headless check of tools/vk_scene.h against a --trace capture (tools/pc_trace.h).
    Build: clang -std=c11 -O1 tools/vk_scene_test.c $(pkg-config --cflags --libs vulkan) -lm -o vk_scene_test
    Run:   vk_scene_test <tracedir> [last_batch_size=344] [scale=1]
+          vk_scene_test --self-test  (no trace assets; checks exact compute transform and mesh XYZ)
    Compares kinds 0 and 1 from the last batch of tris.bin with color.bin at scale 1, then checks
    persistent texture cache, ordered material draws, independent kind-6 layer, and mixed projection. */
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,8 +236,131 @@ static int check_projection(VkPhysicalDevice physical, VkDevice device, VkQueue 
     return ok;
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <tracedir> [batch] [scale]\n", argv[0]); return 2; }
+enum { TRANSFORM_COUNT = 65 };
+
+static uint32_t transform_reference(const uint32_t row[4], const uint32_t world[3]) {
+    uint32_t dot = 0;
+    for (unsigned c = 0; c < 3; c++) dot += (uint32_t)((uint64_t)row[c] * world[c]);
+    /* Interpret the wrapped sum as signed, then floor-divide without a signed shift. */
+    int64_t signed_dot = dot;
+    if (dot & 0x80000000u) signed_dot -= INT64_C(0x100000000);
+    int64_t shifted = (signed_dot < 0 ? signed_dot - 255 : signed_dot) / 256;
+    return (uint32_t)(shifted + row[3]);
+}
+
+static int check_transform_dispatch(vk_scene *scene, const char *name, const uint32_t rows[3][4],
+                                    const uint32_t world[][3], uint32_t count) {
+    const uint32_t guard = 0xdeadbeefu;
+    uint32_t camera[TRANSFORM_COUNT + 1][3];
+    for (unsigned i = 0; i <= TRANSFORM_COUNT; i++)
+        for (unsigned axis = 0; axis < 3; axis++) camera[i][axis] = guard;
+    if (!vk_scene_transform(scene, rows, world, camera, count)) {
+        fprintf(stderr, "transform %s (count %u) failed\n", name, count);
+        return 0;
+    }
+    for (unsigned i = 0; i <= TRANSFORM_COUNT; i++) {
+        for (unsigned axis = 0; axis < 3; axis++) {
+            uint32_t expected = i < count ? transform_reference(rows[axis], world[i]) : guard;
+            if (camera[i][axis] != expected) {
+                fprintf(stderr, "transform %s (count %u), vertex %u %c: got %08" PRIx32
+                        ", expected %08" PRIx32 "%s\n", name, count, i, "XYZ"[axis], camera[i][axis],
+                        expected, i < count ? "" : " (outside count)");
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int check_mesh(vk_scene *scene) {
+    /* Signed-short extrema and mixed signs; the rows wrap both dot products and translations. */
+    static const uint32_t world[][3] = {{-32768, 3, 5}, {32767, -32768, -1}, {-23, 0, 32767}};
+    static const uint32_t rows[3][4] = {
+        {65537, 1, 1, 0x7fffffffu}, {-1, 0x40000005u, -7, 0xffffffffu},
+        {0x80000003u, -255, 65537, 0x80000000u},
+    };
+    /* Exact result words, not a second implementation of the shader. For example, for world[0]
+       and row 0 the dot wraps to 0x7fff8008; at shift 8 the translated sum is 0x807fff7f,
+       so the final arithmetic shift must produce 0xff807fff (not 0x00807fff). */
+    static const struct { unsigned shift; uint32_t xyz[3][3]; } fixtures[] = {
+        {0,  {{0xffff8007u, 0xc0007febu, 0x80037d08u}, {0xfffefffdu, 0xfffd0007u, 0x007ffffcu},
+              {0x7fe97fe7u, 0xfffc801du, 0x7fff7fbau}}},
+        {1,  {{0xdfffe001u, 0xf0001ffau, 0xc000df42u}, {0xdfffbfffu, 0xffff4001u, 0x201fffffu},
+              {0x3ffa5ff9u, 0xffff2007u, 0x3fffdfeeu}}},
+        {8,  {{0xff807fffu, 0xffffc000u, 0xff800003u}, {0xff807ffeu, 0xfffffffcu, 0x007f807fu},
+              {0x007fffe9u, 0xfffffffcu, 0x007fffffu}}},
+        {31, {{0, 0xffffffffu, 0xffffffffu}, {0, 0xffffffffu, 0}, {0, 0xffffffffu, 0}}},
+    };
+    uint32_t io[TRANSFORM_COUNT + 1][3];
+    if (!vk_scene_transform_mesh(NULL, NULL, NULL, NULL, 0, 31)) return 0;
+    for (size_t f = 0; f < sizeof fixtures / sizeof fixtures[0]; ++f) {
+        for (unsigned i = 0; i <= TRANSFORM_COUNT; ++i) memcpy(io[i], world[i % 3], sizeof io[i]);
+        if (!vk_scene_transform_mesh(scene, rows, io, io, TRANSFORM_COUNT, fixtures[f].shift)) {
+            fprintf(stderr, "mesh dispatch failed at shift %u\n", fixtures[f].shift);
+            return 0;
+        }
+        for (unsigned i = 0; i <= TRANSFORM_COUNT; ++i) {
+            const uint32_t *want = i < TRANSFORM_COUNT ? fixtures[f].xyz[i % 3] : world[i % 3];
+            for (unsigned a = 0; a < 3; ++a) if (io[i][a] != want[a]) {
+                fprintf(stderr, "mesh shift %u, vertex %u %c: got %08" PRIx32 ", expected %08" PRIx32 "\n",
+                        fixtures[f].shift, i, "XYZ"[a], io[i][a], want[a]);
+                return 0;
+            }
+        }
+    }
+    memcpy(io, world, sizeof world);
+    if (vk_scene_transform_mesh(scene, rows, world, io, 3, 32) || memcmp(io, world, sizeof world)) {
+        fprintf(stderr, "mesh invalid shift not rejected without output changes\n");
+        return 0;
+    }
+    puts("compute mesh exact XYZ passed (shifts 0, 1, 8, 31; invalid shift rejected)");
+    return 1;
+}
+
+static int check_transform(VkPhysicalDevice physical, VkDevice device, VkQueue queue, uint32_t family) {
+    const uint32_t rows[3][4] = {
+        /* Vertex 0 wraps the products and sum, and its negative X dot needs a signed shift. */
+        { 3, 1, 1, 0x00800000u },       /* X: 0x80000005 >> 8, then translation wraps to zero. */
+        { 2, 2, 5, 0xffffffffu },       /* Y: dot wraps to 29, then shift and add give 0xffffffff. */
+        { 2, 0xffffffffu, 256, 0x7fffffffu }, /* Z: positive shift crosses the signed boundary on add. */
+    };
+    const uint32_t repeat_rows[3][4] = {
+        { 0xfffffdfdu, 257, 0x80000001u, 0x12345678u },
+        { 0x40000005u, 0xfffffff9u, 31, 0xfedcba98u },
+        { 17, 0x01000001u, 0xfffffeffu, 0x80000000u },
+    };
+    uint32_t world[TRANSFORM_COUNT][3] = { { 0x7fffffffu, 3, 5 } };
+    for (uint32_t i = 1; i < TRANSFORM_COUNT; i++) {
+        world[i][0] = 0x80000001u + i * 0x1020305u;
+        world[i][1] = i * 0x31415927u;
+        world[i][2] = 0xffffffffu - i * 0x01020307u;
+    }
+
+    vk_scene scene;
+    if (!vk_scene_create(&scene, physical, device, queue, family, 4, 4, 1)) {
+        fprintf(stderr, "could not create scene for transform self-test\n");
+        return 1;
+    }
+    int ok = check_transform_dispatch(&scene, "empty", rows, world, 0) &&
+             check_transform_dispatch(&scene, "edge arithmetic", rows, world, 1) &&
+             check_transform_dispatch(&scene, "two workgroups", rows, world, TRANSFORM_COUNT) &&
+             check_mesh(&scene);
+    if (ok) {
+        for (uint32_t i = 0; i < TRANSFORM_COUNT; i++) {
+            world[i][0] ^= 0xdeadbeefu;
+            world[i][1] += 0x8000000du;
+            world[i][2] ^= i + 0x12345678u;
+        }
+        ok = check_transform_dispatch(&scene, "changed inputs and rows", repeat_rows, world, TRANSFORM_COUNT) &&
+             check_transform_dispatch(&scene, "shrink", rows, world, 1) &&
+             check_transform_dispatch(&scene, "empty after dispatch", repeat_rows, world, 0);
+    }
+    vk_scene_destroy(&scene);
+    if (ok) puts("compute transform exact XYZ passed (counts 0, 1, 65 and repeated dispatches)");
+    return !ok;
+}
+
+static int check_trace(int argc, char **argv, VkPhysicalDevice physical, VkDevice device, VkQueue queue, uint32_t family) {
     const char *dir = argv[1];
     unsigned batch = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 344;
     unsigned scale = argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 1;
@@ -279,27 +404,6 @@ int main(int argc, char **argv) {
         kind_counts[r[0]]++;
     }
     printf("batch %u: kind0=%u kind1=%u textures=%u guest %ux%u\n", batch, kind_counts[0], kind_counts[1], texture_count, gw, gh);
-
-    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO }; app.apiVersion = VK_API_VERSION_1_0;
-    VkInstanceCreateInfo ic = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO }; ic.pApplicationInfo = &app;
-    VkInstance instance;
-    if (vkCreateInstance(&ic, NULL, &instance) != VK_SUCCESS) { fprintf(stderr, "vkCreateInstance failed\n"); return 1; }
-    uint32_t n = 1; VkPhysicalDevice physical;
-    if (vkEnumeratePhysicalDevices(instance, &n, &physical) < 0 || n == 0) { fprintf(stderr, "no Vulkan device\n"); return 1; }
-    uint32_t family = 0, qn = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physical, &qn, NULL);
-    VkQueueFamilyProperties *qs = calloc(qn, sizeof *qs);
-    vkGetPhysicalDeviceQueueFamilyProperties(physical, &qn, qs);
-    for (family = 0; family < qn && !(qs[family].queueFlags & VK_QUEUE_GRAPHICS_BIT); family++);
-    free(qs);
-    float priority = 1.0f;
-    VkDeviceQueueCreateInfo qc = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, family, 1, &priority };
-    VkDeviceCreateInfo dc = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO }; dc.queueCreateInfoCount = 1; dc.pQueueCreateInfos = &qc;
-    VkDevice device; VkQueue queue;
-    if (vkCreateDevice(physical, &dc, NULL, &device) != VK_SUCCESS) { fprintf(stderr, "vkCreateDevice failed\n"); return 1; }
-    vkGetDeviceQueue(device, family, 0, &queue);
-    VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(physical, &props);
-    printf("device: %s\n", props.deviceName);
 
     vk_scene scene;
     int status = 1;
@@ -369,9 +473,71 @@ cache_checks:
     status = 0;
 cleanup:
     vk_scene_destroy(&scene);
-    vkDestroyDevice(device, NULL);
-    vkDestroyInstance(instance, NULL);
     for (uint32_t i = 0; i < texture_count; i++) free(texture_files[i]);
     free(tris); free(records); free(colour_file);
+    return status;
+}
+
+static int find_test_queue(VkInstance instance, VkQueueFlags required, VkPhysicalDevice *physical, uint32_t *family) {
+    uint32_t n = 0;
+    if (vkEnumeratePhysicalDevices(instance, &n, NULL) != VK_SUCCESS || n == 0) return 0;
+    VkPhysicalDevice *devices = malloc(n * sizeof *devices);
+    if (!devices) return 0;
+    int found = 0;
+    if (vkEnumeratePhysicalDevices(instance, &n, devices) >= 0) {
+        for (uint32_t i = 0; i < n && !found; i++) {
+            uint32_t qn = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &qn, NULL);
+            if (qn == 0) continue;
+            VkQueueFamilyProperties *qs = malloc(qn * sizeof *qs);
+            if (!qs) break;
+            vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &qn, qs);
+            for (uint32_t q = 0; q < qn; q++) {
+                if (!qs[q].queueCount || (qs[q].queueFlags & required) != required) continue;
+                *physical = devices[i];
+                *family = q;
+                found = 1;
+                break;
+            }
+            free(qs);
+        }
+    }
+    free(devices);
+    return found;
+}
+
+int main(int argc, char **argv) {
+    const int self_test = argc >= 2 && !strcmp(argv[1], "--self-test");
+    if (argc < 2 || (self_test && argc != 2)) {
+        fprintf(stderr, "usage: %s <tracedir> [batch] [scale]\n       %s --self-test\n", argv[0], argv[0]);
+        return 2;
+    }
+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO }; app.apiVersion = VK_API_VERSION_1_0;
+    VkInstanceCreateInfo ic = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO }; ic.pApplicationInfo = &app;
+    VkInstance instance;
+    if (vkCreateInstance(&ic, NULL, &instance) != VK_SUCCESS) { fprintf(stderr, "vkCreateInstance failed\n"); return 1; }
+    VkPhysicalDevice physical;
+    uint32_t family;
+    VkQueueFlags required = VK_QUEUE_GRAPHICS_BIT | (self_test ? VK_QUEUE_COMPUTE_BIT : 0);
+    int status = 1;
+    if (!find_test_queue(instance, required, &physical, &family)) {
+        fprintf(stderr, "no Vulkan device with a %s queue\n", self_test ? "graphics+compute" : "graphics");
+        goto cleanup;
+    }
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo qc = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, family, 1, &priority };
+    VkDeviceCreateInfo dc = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO }; dc.queueCreateInfoCount = 1; dc.pQueueCreateInfos = &qc;
+    VkDevice device;
+    if (vkCreateDevice(physical, &dc, NULL, &device) != VK_SUCCESS) { fprintf(stderr, "vkCreateDevice failed\n"); goto cleanup; }
+    VkQueue queue;
+    vkGetDeviceQueue(device, family, 0, &queue);
+    VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(physical, &props);
+    printf("device: %s\n", props.deviceName);
+
+    status = self_test ? check_transform(physical, device, queue, family) :
+                         check_trace(argc, argv, physical, device, queue, family);
+    vkDestroyDevice(device, NULL);
+cleanup:
+    vkDestroyInstance(instance, NULL);
     return status;
 }

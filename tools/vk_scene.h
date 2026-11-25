@@ -65,6 +65,17 @@ typedef struct {
 typedef struct { uint32_t first, texture, kind, count, triangle; uint8_t alpha; } vks_run;
 
 typedef struct {
+    VkDescriptorSetLayout set_layout;
+    VkPipelineLayout layout;
+    VkPipeline pipeline;
+    VkDescriptorPool pool;
+    VkDescriptorSet set;
+    vks_buffer vertices;
+    VkDeviceSize capacity;
+    uint32_t max_range, max_groups;
+} vks_transform;
+
+typedef struct {
     VkPhysicalDevice physical; VkDevice device; VkQueue queue; uint32_t family;
     uint32_t guest_width, guest_height, scale, width, height;
     vks_image colour, depth;
@@ -88,6 +99,7 @@ typedef struct {
     vks_buffer readback; /* RGBA8, width*height, row 0 = top */
     vks_buffer layers_readback; /* primary D32, kind-6 RGBA8, kind-6 D32 */
     VkDeviceSize layers_capacity;
+    vks_transform transform;
 } vk_scene;
 
 typedef struct { int32_t xy_inv[3]; float abz[3]; } vks_vertex;
@@ -212,6 +224,15 @@ static VkShaderModule vks_shader(const vk_scene *s, const uint32_t *code, size_t
     return module;
 }
 
+static void vks_transform_destroy(const vk_scene *s, vks_transform *t) {
+    if (t->pool) vkDestroyDescriptorPool(s->device, t->pool, NULL);
+    if (t->pipeline) vkDestroyPipeline(s->device, t->pipeline, NULL);
+    if (t->layout) vkDestroyPipelineLayout(s->device, t->layout, NULL);
+    if (t->set_layout) vkDestroyDescriptorSetLayout(s->device, t->set_layout, NULL);
+    vks_buffer_destroy(s, &t->vertices);
+    memset(t, 0, sizeof *t);
+}
+
 static void vk_scene_destroy(vk_scene *s) {
     if (!s->device) return;
     vkDeviceWaitIdle(s->device);
@@ -219,6 +240,7 @@ static void vk_scene_destroy(vk_scene *s) {
     vks_buffer_destroy(s, &s->layers_readback);
     if (s->fence) vkDestroyFence(s->device, s->fence, NULL);
     if (s->pool) vkDestroyCommandPool(s->device, s->pool, NULL);
+    vks_transform_destroy(s, &s->transform);
     if (s->texture_pool) vkDestroyDescriptorPool(s->device, s->texture_pool, NULL);
     if (s->snapshot_pool) vkDestroyDescriptorPool(s->device, s->snapshot_pool, NULL);
     vks_image_destroy(s, &s->snapshot);
@@ -373,6 +395,143 @@ fail:
     if (blend_fragment) vkDestroyShaderModule(device, blend_fragment, NULL);
     vk_scene_destroy(s);
     return 0;
+}
+
+typedef struct { uint32_t rows[3][4], count, shift, post_shift; } vks_transform_push;
+_Static_assert(offsetof(vks_transform_push, count) == 48 && offsetof(vks_transform_push, shift) == 52 &&
+               offsetof(vks_transform_push, post_shift) == 56 && sizeof(vks_transform_push) == 60,
+               "transform shader push constant layout");
+
+static int vks_transform_prepare(vk_scene *s) {
+    vks_transform *t = &s->transform;
+    if (t->pipeline) return 1;
+
+    // Graphics-only families remain valid for rendering, but not for dispatch.
+    uint32_t families = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(s->physical, &families, NULL);
+    if (s->family >= families) return 0;
+    families = s->family + 1;
+    VkQueueFamilyProperties *props = calloc(families, sizeof *props);
+    if (!props) return 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(s->physical, &families, props);
+    int compute = s->family < families && (props[s->family].queueFlags & VK_QUEUE_COMPUTE_BIT);
+    free(props);
+    if (!compute) return 0;
+
+    VkPhysicalDeviceProperties physical;
+    vkGetPhysicalDeviceProperties(s->physical, &physical);
+    t->max_range = physical.limits.maxStorageBufferRange;
+    t->max_groups = physical.limits.maxComputeWorkGroupCount[0];
+
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayoutBinding binding = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+    VkDescriptorSetLayoutCreateInfo set = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    set.bindingCount = 1; set.pBindings = &binding;
+    VKS_CHECK(vkCreateDescriptorSetLayout(s->device, &set, NULL, &t->set_layout));
+    VkPushConstantRange push = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vks_transform_push) };
+    VkPipelineLayoutCreateInfo layout = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    layout.setLayoutCount = 1; layout.pSetLayouts = &t->set_layout;
+    layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
+    VKS_CHECK(vkCreatePipelineLayout(s->device, &layout, NULL, &t->layout));
+    VkDescriptorPoolSize size = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+    VkDescriptorPoolCreateInfo pool = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pool.maxSets = 1; pool.poolSizeCount = 1; pool.pPoolSizes = &size;
+    VKS_CHECK(vkCreateDescriptorPool(s->device, &pool, NULL, &t->pool));
+    VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    alloc.descriptorPool = t->pool; alloc.descriptorSetCount = 1; alloc.pSetLayouts = &t->set_layout;
+    VKS_CHECK(vkAllocateDescriptorSets(s->device, &alloc, &t->set));
+    shader = vks_shader(s, scene_transform_spirv, sizeof scene_transform_spirv);
+    if (!shader) goto fail;
+    VkComputePipelineCreateInfo pipeline = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline.stage.module = shader; pipeline.stage.pName = "main"; pipeline.layout = t->layout;
+    VKS_CHECK(vkCreateComputePipelines(s->device, VK_NULL_HANDLE, 1, &pipeline, NULL, &t->pipeline));
+    vkDestroyShaderModule(s->device, shader, NULL);
+    return 1;
+fail:
+    if (shader) vkDestroyShaderModule(s->device, shader, NULL);
+    vks_transform_destroy(s, t);
+    return 0;
+}
+
+static int vks_transform_dispatch(vk_scene *s, const uint32_t rows[3][4], const uint32_t (*world)[3],
+                                  uint32_t (*camera)[3], uint32_t count, unsigned shift, unsigned post_shift) {
+    if (!count) return 1;
+    if (!s || !s->device || !rows || !world || !camera || !vks_transform_prepare(s)) return 0;
+    vks_transform *t = &s->transform;
+    VkDeviceSize size = (VkDeviceSize)count * sizeof *world;
+    uint32_t groups = 1 + (count - 1) / 64;
+    if (size > t->max_range || size > SIZE_MAX || groups > t->max_groups) return 0;
+
+    int submitted = 0;
+    VkCommandBuffer cb = s->commands;
+    VKS_CHECK(vkResetCommandBuffer(cb, 0));
+    if (size > t->capacity) {
+        VkDeviceSize capacity = t->capacity + t->capacity / 2;
+        if (capacity > t->max_range) capacity = t->max_range;
+        if (capacity < size) capacity = size;
+        vks_buffer buffer;
+        if (!vks_buffer_create(s, &buffer, capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) return 0;
+        VkDescriptorBufferInfo info = { buffer.buffer, 0, capacity };
+        VkWriteDescriptorSet write = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = t->set; write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; write.pBufferInfo = &info;
+        vkUpdateDescriptorSets(s->device, 1, &write, 0, NULL);
+        vks_buffer_destroy(s, &t->vertices);
+        t->vertices = buffer; t->capacity = capacity;
+    }
+
+    vks_transform_push push;
+    memcpy(push.rows, rows, sizeof push.rows);
+    push.count = count;
+    push.shift = shift;
+    push.post_shift = post_shift;
+    memcpy(t->vertices.mapped, world, (size_t)size);
+    VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VKS_CHECK(vkBeginCommandBuffer(cb, &begin));
+    // Coherent host writes are made available to the device by queue submission.
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, t->pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, t->layout, 0, 1, &t->set, 0, NULL);
+    vkCmdPushConstants(cb, t->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+    vkCmdDispatch(cb, groups, 1, 1);
+    VkBufferMemoryBarrier host = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    host.srcQueueFamilyIndex = host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host.buffer = t->vertices.buffer; host.size = size;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, NULL, 1, &host, 0, NULL);
+    VKS_CHECK(vkEndCommandBuffer(cb));
+    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1; submit.pCommandBuffers = &cb;
+    VKS_CHECK(vkResetFences(s->device, 1, &s->fence));
+    VKS_CHECK(vkQueueSubmit(s->queue, 1, &submit, s->fence));
+    submitted = 1;
+    VKS_CHECK(vkWaitForFences(s->device, 1, &s->fence, VK_TRUE, UINT64_MAX));
+    memcpy(camera, t->vertices.mapped, (size_t)size);
+    return 1;
+fail:
+    if (submitted) vkDeviceWaitIdle(s->device);
+    return 0;
+}
+
+/* Both transforms are synchronous; the caller serializes access to the scene and queue.
+   World and camera are packed triples of 32-bit words, and may alias. Camera is only written on
+   success. Nonempty batches require compute support; empty batches do not use Vulkan.
+   Each row computes a wrapped 32-bit dot with world.xyz, arithmetic shifts by 8, then adds row[3]. */
+static inline int vk_scene_transform(vk_scene *s, const uint32_t rows[3][4], const uint32_t (*world)[3],
+                                     uint32_t (*camera)[3], uint32_t count) {
+    return vks_transform_dispatch(s, rows, world, camera, count, 8, 0);
+}
+
+/* Guest mesh transform (E32 0x8a104): pass the signed-short XYZ sign-extended to 32 bits.
+   Each row computes ASR(wrap(ASR(wrapped_dot, shift) + row[3]), shift), including the second shift
+   after translation. As above, arithmetic uses packed 32-bit words. Only shifts 0..31 are valid. */
+static int vk_scene_transform_mesh(vk_scene *s, const uint32_t rows[3][4], const uint32_t (*world)[3],
+                                   uint32_t (*camera)[3], uint32_t count, unsigned shift) {
+    if (shift > 31) return 0;
+    return vks_transform_dispatch(s, rows, world, camera, count, shift, shift);
 }
 
 static uint8_t vks_expand(unsigned value, unsigned bits) { return (uint8_t)((value << (8 - bits)) | (value >> (2 * bits - 8))); }

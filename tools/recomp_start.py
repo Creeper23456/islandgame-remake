@@ -283,6 +283,7 @@ HOST_ENTRY_HOOKS = {
     0x68ebc: 'host_tris_end(stack, r[10]);',
     0x68f80: 'host_scene_alpha(stack, r[10]);',  # immediately after guest alpha, before HUD
     0x711f0: 'host_tris_project(stack, r);',  # pre-projection camera-space batch (opt-in)
+    0x8a250: 'host_tris_mesh_check(stack, r);',  # all camera XYZ written; before the mesh cursor store
     0x70e44: 'host_tris_plan_forward(stack, r);',  # validate and optionally render before forward raster dispatch
     0x698cc: 'timing_frame(stack, r[0]);',  # ISLAND_TIMING_LOG=1: frame interval and media stream state
     0x59bf4: 'timing_ret(r[0]);',  # ISLAND_TIMING_LOG=1: value returned by the CGame tick (vtable +0xc)
@@ -1882,6 +1883,8 @@ static unsigned capture_count;
 {(Path(__file__).with_name('pc_debug.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('vk_scene_spirv.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('vk_scene.h').read_text() if app_profile else '')}
+{('static unsigned le16(const unsigned char *bytes);' if app_profile else '')}
+{('static uint32_t le32(const unsigned char *bytes);' if app_profile else '')}
 {(Path(__file__).with_name('host_tris.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('pc_trace.h').read_text() if app_profile and trace else '')}
 

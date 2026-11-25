@@ -1,0 +1,27 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Vertices {
+    uint xyz[]; // Three packed words per vertex, transformed in place.
+} vertices;
+layout(push_constant) uniform Transform {
+    uvec4 rows[3];
+    uint count;
+    uint shift;
+    uint post_shift; // Zero for the world transform; same as shift for guest meshes.
+} transform;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= transform.count) return;
+    uint base = i * 3u;
+    uvec3 world = uvec3(vertices.xyz[base], vertices.xyz[base + 1u], vertices.xyz[base + 2u]);
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        uvec4 row = transform.rows[axis];
+        uvec3 products = row.xyz * world;
+        uint dot_bits = products.x + products.y + products.z;
+        // The dot and translation wrap as uint; only the shifts interpret the bits as signed.
+        uint translated = uint(int(dot_bits) >> transform.shift) + row.w;
+        vertices.xyz[base + axis] = uint(int(translated) >> transform.post_shift);
+    }
+}

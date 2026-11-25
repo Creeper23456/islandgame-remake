@@ -16,6 +16,8 @@
    compares the scale-1 result with the guest colour buffer at the same moment and logs the match counts.
    ISLAND_VK_PROJECT=1 opts into redoing the guest's projection on the GPU for verified compositor
    submissions; transform and clipping remain guest-side. Unmatched triangles keep screen-space XY.
+   ISLAND_VK_MESH_CHECK=1 independently compares the first eligible pre-clip mesh per presented frame
+   against Vulkan (up to eight samples per run). The guest transform and its output stay authoritative.
    ISLAND_VK_SKIP_RASTER=1 (requires ISLAND_VK_SCENE=1) can commit a complete forward batch's Vulkan
    output to the native render planes before the guest rasterizers run. Only their pixel loops are
    bypassed; the caller and rasterizer prefixes still execute. ISLAND_VK_PLAN_CHECK=1 independently
@@ -54,6 +56,8 @@ static void host_prof_frame(void) {
 #define HOST_PROJECT_TABLE 0x44u
 #define HOST_PROJECT_TABLE_COUNT 70000u /* renderer initialization fills indices 0..69999 */
 #define HOST_PRIMARY_COLOUR 0x447ecu
+#define HOST_MESH_MAX 4096u
+#define HOST_MESH_SAMPLES 8u
 
 static const unsigned char *host_bytes(uint32_t address, uint32_t size) {
     uint32_t offset = address - heap_base;
@@ -118,6 +122,14 @@ static struct {
     unsigned live_count, dropped;
     uint32_t composite_session;
 } host_tris;
+
+static struct {
+    int enabled;
+    unsigned samples, vertices, mismatched_vertices, mismatched_words;
+    uint32_t frame;
+    vk_scene scene; /* private 1x1 context when the Vulkan raster scene is not active */
+    uint32_t xyz[HOST_MESH_MAX][3];
+} host_mesh;
 
 static struct { struct host_tri *tris; unsigned count, serial; } host_tris_frame;
 static struct host_tri host_tris_frozen[HOST_TRIS_MAX];
@@ -194,6 +206,8 @@ static void host_tris_configure(void) {
     host_tris.enabled |= host_tris.scene_enabled;
     text = getenv("ISLAND_VK_PROJECT");
     host_tris.project_enabled = host_tris.scene_enabled && text && strcmp(text, "1") == 0;
+    text = getenv("ISLAND_VK_MESH_CHECK");
+    host_mesh.enabled = text && strcmp(text, "1") == 0;
     host_prof.on = (text = getenv("ISLAND_VK_PROFILE")) && strcmp(text, "1") == 0;
     text = getenv("ISLAND_VK_SKIP_RASTER");
     host_tris.skip_raster = host_tris.scene_enabled && text && strcmp(text, "1") == 0;
@@ -356,6 +370,104 @@ static int host_scene_target(uint32_t *stack, uint32_t session, struct host_scen
         !((t->colour | t->colour6) & 1) && !((t->depth | t->depth6) & 3) &&
         host_bytes(t->colour, n * 2) && host_bytes(t->depth, n * 4) &&
         host_bytes(t->colour6, n * 2) && host_bytes(t->depth6, n * 4) && host_bytes(t->alpha, n);
+}
+
+static void host_mesh_release(void) {
+    vk_scene_destroy(&host_mesh.scene);
+}
+
+static int host_mesh_overlap(uint32_t a, uint32_t a_size, uint32_t b, uint32_t b_size) {
+    return a < (uint64_t)b + b_size && b < (uint64_t)a + a_size;
+}
+
+/* 0x8a250 is reached after the final XYZ store at 0x8a23c; the <=0 path
+   goes directly to 0x8a254. r8 is the mesh, r7 the matrix, r9 the output
+   base, r10 the shift, r1/r2 the finished loop count and mesh count.
+   r5/r6 are the last XYZ byte offset and destination. 0x8a250 itself
+   only stores the matrix cursor; clipping runs after the call returns. */
+static void host_tris_mesh_check(uint32_t *stack, const uint32_t *r) {
+    uint32_t session = host_tris.composite_session;
+    if (!host_mesh.enabled || !session || !vk_present.device || host_mesh.samples >= HOST_MESH_SAMPLES ||
+        (host_mesh.samples && host_mesh.frame == debug_frame_count)) return;
+
+    uint32_t mesh = r[8], count = r[2], shift = r[10];
+    if (!count || count > HOST_MESH_MAX || count != r[1] || shift > 31 ||
+        !host_texture_words(mesh, 0x150)) return;
+    uint32_t rows_addr = guest_read(stack, mesh + 0x134), input_addr = guest_read(stack, mesh + 0x138);
+    uint32_t output_addr = guest_read(stack, mesh + 0x13c), last = 12 * (count - 1);
+    if (rows_addr != r[7] || output_addr != r[9] || r[5] != last || r[6] - output_addr != last ||
+        count != guest_read(stack, mesh + 0x14c) || shift != guest_read_small(stack, mesh + 0x7c, 1) ||
+        ((rows_addr | output_addr) & 3) || (input_addr & 1)) return;
+    /* The emitter can receive a matrix from the renderer's stack frame. */
+    int rows_mapped = rows_addr - (uint32_t)stack_base <= stack_size - 48 || host_bytes(rows_addr, 48);
+    const unsigned char *input = host_bytes(input_addr, 6 * count);
+    const unsigned char *output = host_bytes(output_addr, 12 * count);
+    if (!rows_mapped || !input || !output ||
+        host_mesh_overlap(output_addr, 12 * count, rows_addr, 48) ||
+        host_mesh_overlap(output_addr, 12 * count, input_addr, 6 * count) ||
+        host_mesh_overlap(output_addr, 12 * count, mesh, 0x150) ||
+        host_mesh_overlap(mesh + 0x90, 12, rows_addr, 48) ||
+        host_mesh_overlap(mesh + 0x90, 12, input_addr, 6 * count)) return;
+
+    struct host_scene_target target;
+    if (!host_texture_words(session, 0x1ce0) || guest_read(stack, session + 0x1cdc) == 0x1a ||
+        guest_read(stack, session + 0x7fc) != 0 || !host_scene_target(stack, session, &target) ||
+        guest_read(stack, mesh + 0xa0) != target.viewport) return;
+    const unsigned char *player = host_bytes(guest_read(stack, session + 0x2cc), 0x5ec);
+    if (!player || player[0x5eb]) return;
+
+    vk_scene *scene = host_scene.created ? &host_scene.scene : &host_mesh.scene;
+    if (!scene->device) {
+        if (!vk_scene_create(scene, vk_present.physical, vk_present.device, vk_present.queue,
+                             vk_present.queue_family, 1, 1, 1) || atexit(host_mesh_release)) {
+            host_mesh_release();
+            fputs("vk-mesh: cannot initialize parity check; disabled\n", stderr);
+            host_mesh.enabled = 0;
+            return;
+        }
+    }
+    uint32_t rows[3][4];
+    for (unsigned y = 0; y < 3; y++)
+        for (unsigned x = 0; x < 4; x++) rows[y][x] = guest_read(stack, rows_addr + 4 * (4 * y + x));
+    for (uint32_t i = 0; i < count; i++)
+        for (unsigned axis = 0; axis < 3; axis++) {
+            uint32_t word = le16(input + 6 * i + 2 * axis);
+            host_mesh.xyz[i][axis] = word | ((0u - (word >> 15)) << 16);
+        }
+    if (!vk_scene_transform_mesh(scene, rows, host_mesh.xyz, host_mesh.xyz, count, shift)) {
+        fputs("vk-mesh: compute unavailable or dispatch failed; disabled\n", stderr);
+        host_mesh.enabled = 0;
+        host_mesh_release();
+        return;
+    }
+
+    unsigned bad_vertices = 0, bad_words = 0, first_axis = 0;
+    uint32_t first_vertex = 0, first_guest = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        unsigned bad = 0;
+        for (unsigned axis = 0; axis < 3; axis++) {
+            uint32_t guest = le32(output + 12 * i + 4 * axis);
+            if (guest == host_mesh.xyz[i][axis]) continue;
+            if (!bad_words) { first_vertex = i; first_axis = axis; first_guest = guest; }
+            bad_words++;
+            bad = 1;
+        }
+        bad_vertices += bad;
+    }
+    host_mesh.frame = debug_frame_count;
+    host_mesh.samples++;
+    host_mesh.vertices += count;
+    host_mesh.mismatched_vertices += bad_vertices;
+    host_mesh.mismatched_words += bad_words;
+    fprintf(stderr, "vk-mesh: frame=%" PRIu32 " sample=%u/%u shift=%" PRIu32 " vertices=%" PRIu32
+            " mismatched_vertices=%u mismatched_words=%u total_vertices=%u total_mismatched_vertices=%u"
+            " total_mismatched_words=%u", host_mesh.frame + 1, host_mesh.samples, HOST_MESH_SAMPLES,
+            shift, count, bad_vertices, bad_words, host_mesh.vertices, host_mesh.mismatched_vertices,
+            host_mesh.mismatched_words);
+    if (bad_words) fprintf(stderr, " first_vertex=%" PRIu32 " axis=%u guest=%08" PRIx32 " gpu=%08" PRIx32,
+                           first_vertex, first_axis, first_guest, host_mesh.xyz[first_vertex][first_axis]);
+    fputc('\n', stderr);
+    if (host_mesh.samples == HOST_MESH_SAMPLES) host_mesh_release();
 }
 
 /* Only the application's own image or heap can supply a recognized renderer
@@ -1012,7 +1124,10 @@ static void host_scene_compose(uint32_t *out, const uint16_t *guest, unsigned wi
 static void host_tris_end(uint32_t *stack, uint32_t session) {
     if (!host_raster.committed) host_scene_invalidate();
     if (!host_tris.configured) host_tris_configure();
-    if (!host_tris.enabled) return;
+    if (!host_tris.enabled) {
+        host_tris.composite_session = 0;  /* mesh-only mode still closes geometry scope */
+        return;
+    }
     host_prof_frame();
     memcpy(host_tris_frozen, host_tris.live, host_tris.live_count * sizeof host_tris.live[0]);
     host_tris_frame.tris = host_tris_frozen;
