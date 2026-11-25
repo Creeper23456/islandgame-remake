@@ -185,6 +185,11 @@ static int rfile_seek(uint32_t *stack, uint32_t self, uint32_t mode, uint32_t po
    (aFile = RFile()), and releasing the stream closes the file. RReadStream::iSrc at +0 holds STREAM_TOKEN | the
    streams[] index; it is not a guest MStreamBuf, so guest code that calls the buffer directly stops at a bad access. */
 #define STREAM_TOKEN UINT32_C(0x5f000000)
+#define WRITE_STREAM_TOKEN UINT32_C(0x5e000000)
+static struct {
+    size_t length;
+    unsigned char bytes[16384]; /* Symbian's default RFileBuf size. */
+} write_stream_buffers[sizeof streams / sizeof streams[0]];
 
 static inline FILE *read_stream_file(const uint32_t *stack, uint32_t self, uint32_t *slot) {
     uint32_t token = guest_read(stack, self);
@@ -193,12 +198,18 @@ static inline FILE *read_stream_file(const uint32_t *stack, uint32_t self, uint3
         ? streams[*slot] : NULL;
 }
 
-/* RFileReadStream::RFileReadStream(RFile&, TInt aPos). */
-static inline int file_read_stream_attach(uint32_t *stack, uint32_t self, uint32_t file_object, uint32_t position) {
+/* RFileReadStream and RFileWriteStream constructors taking an open file and offset. */
+static inline int file_stream_attach(uint32_t *stack, uint32_t self, uint32_t file_object, uint32_t position,
+                                     uint32_t token) {
     FILE *file = rfile_stream(stack, file_object);
     uint32_t slot = guest_read(stack, file_object + 4);
     if (!file || (int32_t)position < 0 || fseek(file, (long)position, SEEK_SET)) return 0;
-    guest_write(stack, self, STREAM_TOKEN | slot);
+    if (token == WRITE_STREAM_TOKEN) {
+        int flags = fcntl(fileno(file), F_GETFL);
+        if (flags < 0 || (flags & O_ACCMODE) == O_RDONLY) return 0;
+        write_stream_buffers[slot].length = 0;
+    }
+    guest_write(stack, self, token | slot);
     guest_write(stack, file_object, 0);
     guest_write(stack, file_object + 4, 0);
     return 1;
@@ -224,6 +235,46 @@ static inline int32_t read_stream_bytes(uint32_t *stack, uint32_t self, unsigned
     *value = 0;
     for (unsigned i = 0; i < size; i++) *value |= (uint32_t)bytes[i] << (8 * i);
     return 0;
+}
+
+static FILE *write_stream_file(const uint32_t *stack, uint32_t self, uint32_t *slot) {
+    uint32_t token = guest_read(stack, self);
+    *slot = token & 0xffffu;
+    return (token & 0xffff0000u) == WRITE_STREAM_TOKEN && *slot && *slot < sizeof streams / sizeof streams[0]
+        ? streams[*slot] : NULL;
+}
+
+static int32_t write_stream_flush(FILE *file, uint32_t slot) {
+    size_t length = write_stream_buffers[slot].length;
+    write_stream_buffers[slot].length = 0;
+    if (fwrite(write_stream_buffers[slot].bytes, 1, length, file) != length || fflush(file))
+        return errno == ENOSPC ? -26 : -2;
+    return 0;
+}
+
+static int32_t write_stream_bytes(const uint32_t *stack, uint32_t self, unsigned size, uint32_t value) {
+    uint32_t slot;
+    FILE *file = write_stream_file(stack, self, &slot);
+    if (!file) return -8;
+    for (unsigned i = 0; i < size; ++i) {
+        if (write_stream_buffers[slot].length == sizeof write_stream_buffers[slot].bytes) {
+            int32_t rc = write_stream_flush(file, slot);
+            if (rc) return rc;
+        }
+        write_stream_buffers[slot].bytes[write_stream_buffers[slot].length++] = (unsigned char)(value >> (8 * i));
+    }
+    return 0;
+}
+
+/* Close commits outstanding bytes; Release (including cleanup after a leave) discards them. */
+static void write_stream_release(uint32_t *stack, uint32_t self, int commit) {
+    uint32_t slot;
+    FILE *file = write_stream_file(stack, self, &slot);
+    if (!file) return;
+    if (commit && write_stream_flush(file, slot)) fputs("RWriteStream::Close: write failed\n", stderr);
+    if (fclose(file)) fputs("RWriteStream: file close failed\n", stderr);
+    streams[slot] = NULL;
+    guest_write(stack, self, 0);
 }
 
 /* RFile::Size(TInt&). */
@@ -682,6 +733,13 @@ static double dbl_arg(const uint32_t *r, unsigned first) {
     double value;
     memcpy(&value, &bits, sizeof value);
     return value;
+}
+
+static inline uint32_t stream_real32_bits(const uint32_t *r) {
+    float value = (float)dbl_arg(r, 2);
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    return bits;
 }
 
 /* Double result into r0:r1. */

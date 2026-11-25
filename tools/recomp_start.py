@@ -231,9 +231,15 @@ def _stream_read(size, convert='value'):
             ' if (rc) return unhandled_leave((uint32_t)rc, r[14]); r[0] = %s; }' % (size, convert))
 
 
+def _stream_write(size, value='r[1]'):
+    return (f'{{ int32_t rc = write_stream_bytes(stack, r[0], {size}, {value});'
+            ' if (rc) return unhandled_leave((uint32_t)rc, r[14]); }')
+
+
 # estor (estor3.def) stream imports reached by the game: ordinal -> C statement.
 ESTOR_OPS = {
-    334: f'if (!file_read_stream_attach(stack, r[0], r[1], r[2])) {_FAIL}',  # RFileReadStream(RFile&, TInt)
+    334: f'if (!file_stream_attach(stack, r[0], r[1], r[2], STREAM_TOKEN)) {_FAIL}',  # RFileReadStream
+    379: f'if (!file_stream_attach(stack, r[0], r[1], r[2], WRITE_STREAM_TOKEN)) {_FAIL}',  # RFileWriteStream
     102: 'cleanup_push_item(r[0], 0, CLEANUP_READ_STREAM);',  # RReadStream::PushL()
     112: 'read_stream_release(stack, r[0]);',  # RReadStream::Release()
     96: _stream_read(4),  # ReadInt32L
@@ -241,6 +247,14 @@ ESTOR_OPS = {
     98: _stream_read(4),  # ReadReal32L: the float bits return in r0 (soft-float EABI)
     100: _stream_read(2),  # ReadUint16L
     113: _stream_read(1, '(uint32_t)(int32_t)(int8_t)value'),  # ReadInt8L
+    160: _stream_write(1),  # WriteInt8L
+    162: _stream_write(4),  # WriteInt32L
+    163: _stream_write(1),  # WriteUint8L
+    164: _stream_write(4, 'stream_real32_bits(r)'),  # WriteReal32L(TReal): aligned double in r2:r3
+    166: _stream_write(2),  # WriteUint16L
+    168: 'write_stream_release(stack, r[0], 1);',  # RWriteStream::Close()
+    169: 'cleanup_push_item(r[0], 0, CLEANUP_WRITE_STREAM);',  # RWriteStream::PushL()
+    179: 'write_stream_release(stack, r[0], 0);',  # RWriteStream::Release()
 }
 
 # ARM condition field to generated-C predicate; 14 (AL) is unconditional, 15 (NV) is not supported.
@@ -632,6 +646,9 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
             elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1677):
                 ops = ['guest_write64(stack, r[0], guest_read64(stack, r[1]) - ((uint64_t)r[3] << 32 | r[2]));',
                        'target = r[14]; goto dispatch;']
+            elif (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1679):
+                # TTime::DateTime() const: hidden result pointer in r0, this in r1.
+                ops = ['time_date_time(stack, r[0], r[1]);', 'target = r[14]; goto dispatch;']
             elif game_dlls and (dll.lower(), ordinal) == ('euser{000a0000}[100039e5].dll', 1308):
                 ops = ['target = load_library(stack, r[0], r[1], r[14]);',
                        'if (!target) return 2;',
@@ -1379,7 +1396,17 @@ def lift(image, entry, reason, attach=False, game_dlls=()):
                   '    case CBASE_VTABLE_BASE: case CBASE_VTABLE_BASE + 4:',
                   '        target = r[14]; goto dispatch;',
                   '    case CBASE_VTABLE_BASE + 8:',
-                  '        guest_write(stack, r[2], 0); r[0] = (uint32_t)-47; target = r[14]; goto dispatch;']
+                  '        guest_write(stack, r[2], 0); r[0] = (uint32_t)-47; target = r[14]; goto dispatch;',
+                  # Host CPeriodic: erase its timer and queue entry; RunError keeps r0; RunL is
+                  # unreachable because the scheduler invokes the periodic TCallBack directly.
+                  '    case PERIODIC_BASE: case PERIODIC_BASE + 4:',
+                  '        if (!periodic_destroy(stack, r[0])) return 3;',
+                  '        target = r[14]; goto dispatch;',
+                  '    case PERIODIC_BASE + 8: case PERIODIC_BASE + 16:',
+                  '        target = r[14]; goto dispatch;',
+                  '    case PERIODIC_BASE + 12:',
+                  '        if (!periodic_cancel(stack, r[0])) return 3;',
+                  '        target = r[14]; goto dispatch;']
         lines += [f'    case MTM_BASE + {slot:#x}:' for slot in range(12, 4 * 64, 4)]
         lines += ['        return trap_slot("CBaseMtm", target - MTM_BASE, r[0]);']
     lines += [f'    case BITGC_BASE + {slot:#x}:' for slot in range(0, 0x11c, 4)]
@@ -1564,6 +1591,49 @@ static int home_time(uint32_t *stack, uint32_t address) {{
     return 1;
 }}
 
+static int time_leap_year(int year) {{
+    return year % 4 == 0 && (year <= 1600 || year % 100 != 0 || year % 400 == 0);
+}}
+
+static int time_year_start(int year) {{
+    /* Count leap years before year, with year 0 a leap year. */
+    int leaps;
+    if (year <= 0) leaps = year / 4;
+    else if (year <= 1600) leaps = 1 + (year - 1) / 4;
+    else {{
+        int n = year - 1601;
+        leaps = 401 + n / 4 - n / 100 + n / 400;
+    }}
+    return year * 365 + leaps;
+}}
+
+static void time_date_time(uint32_t *stack, uint32_t result, uint32_t self) {{
+    const int64_t day_us = INT64_C(86400000000);
+    int64_t time = (int64_t)guest_read64(stack, self);
+    int days = (int)(time / day_us);
+    int64_t within = time % day_us;
+    if (within < 0) {{ --days; within += day_us; }}
+
+    int year = days * 4 / 1461;
+    while (days < time_year_start(year)) --year;
+    while (days >= time_year_start(year + 1)) ++year;
+    int day = days - time_year_start(year);
+    static const int month_days[] = {{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}};
+    int month = 0;
+    for (;;) {{
+        int length = month_days[month] + (month == 1 && time_leap_year(year));
+        if (day < length) break;
+        day -= length;
+        ++month;
+    }}
+
+    uint32_t seconds = (uint32_t)(within / 1000000);
+    uint32_t fields[] = {{(uint32_t)year, (uint32_t)month, (uint32_t)day,
+                        seconds / 3600, seconds / 60 % 60, seconds % 60,
+                        (uint32_t)(within % 1000000)}};
+    for (unsigned i = 0; i < 7; ++i) guest_write(stack, result + 4 * i, fields[i]);
+}}
+
 static void guest_write_small(uint32_t *stack, uint32_t address, uint32_t value, unsigned size) {{
     if (address & (size - 1)) invalid_word(address);
     unsigned shift = (address & 3) * 8;
@@ -1735,6 +1805,7 @@ static unsigned capture_count;
 #define TRAP_CLEANUP_DESTROY UINT32_C(0xff009000)
 #define WORKER_SCHEDULER_STEP UINT32_C(0xff009004)
 #define WORKER_SCHEDULER_DESTROY UINT32_C(0xff009008)
+#define PERIODIC_BASE UINT32_C(0xff00d000)
 {(Path(__file__).with_name('window_gc.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('fbs_bitmap.h').read_text() if app_profile else '')}
 {(Path(__file__).with_name('game_files.h').read_text() if app_profile else '')}
@@ -1791,7 +1862,7 @@ enum {{ DISPLAY_RGB565 = 7 }}; /* EColor64K */
 enum {{ font_spec_size = 72, font_spec_height = 56 }};
 /* CleanupStack entries: a CBase* (destroyed through its deleting destructor), a TAny* (User::Free), a
    TCleanupItem (operation called with the pointer), or an RReadStream (CleanupReleasePushL: Release()). */
-enum {{ CLEANUP_CBASE, CLEANUP_ANY, CLEANUP_ITEM, CLEANUP_READ_STREAM }};
+enum {{ CLEANUP_CBASE, CLEANUP_ANY, CLEANUP_ITEM, CLEANUP_READ_STREAM, CLEANUP_WRITE_STREAM }};
 static struct guest_cleanup main_cleanup;
 #define cleanup_items ((current_worker ? &current_worker->cleanup : &main_cleanup)->items)
 #define cleanup_depth ((current_worker ? &current_worker->cleanup : &main_cleanup)->depth)
@@ -2128,9 +2199,24 @@ static int create_timer(uint32_t *stack, uint32_t handle) {{
     return 1;
 }}
 
+static uint32_t periodic_host_vtable(uint32_t *stack) {{
+    /* CPeriodic lives in euser, which is not translated, so the host builds its CActive vtable:
+       destructors (+0/+4), RunError (+8, returns the error in r0), DoCancel (+12) and RunL (+16).
+       The scheduler calls a periodic object's TCallBack directly, so RunL is only a safe placeholder. */
+    static uint32_t vtable;
+    if (!vtable) {{
+        vtable = heap_try_alloc(20);
+        if (!vtable) return 0;
+        for (uint32_t slot = 0; slot < 20; slot += 4) guest_write(stack, vtable + slot, PERIODIC_BASE + slot);
+    }}
+    return vtable;
+}}
+
 static uint32_t new_periodic(uint32_t *stack, uint32_t priority) {{
     /* CActive (28 bytes), RTimer (4), interval and TCallBack (12). */
-    uint32_t timer = heap_alloc_zeroed(44);
+    uint32_t vtable = periodic_host_vtable(stack), timer = heap_alloc_zeroed(44);
+    if (!vtable) return 0;
+    guest_write(stack, timer, vtable);
     guest_write(stack, timer + 20, priority);
     return create_timer(stack, timer + 28) && add_active(stack, timer) ? timer : 0;
 }}
@@ -2205,21 +2291,531 @@ static int run_nested_event(uint32_t *stack, uint32_t target, uint32_t argument,
     return guest_run(&nested, stack) == 0;
 }}
 
-/* Deliver one SDL transition per scheduler pass so a short tap reaches the guest update. */
+/* PC input surface: physical keys and pointer events enter here. The original key codes stay
+   authoritative: every host path ends in an EEventKeyDown/Up pair carrying a code the phone build
+   already emits, so no host route can call an item script, allocate an item id or mutate the
+   inventory on its own. Host-only PC actions (Q/E/F/Tab/pointer) are dispatched by explicit input
+   context and only route when a hook installed for that exact context returns a verified code; an
+   unrouted action resolves to 0 and is dropped.
+
+   Visibility and configuration: ISLAND_PC_INPUT="key=value,key=value" overrides the effective
+   layer once at startup and the resolved values are logged to stderr. Keys: ok, back, items
+   (original softkey codes), drag (drag threshold in logical px), pointer/right/tab/q/e/f (0/1),
+   tabkey/qkey/ekey/fkey (SDL scancodes) and context (scene|dialogue|menu|inventory|item).
+   Unknown or invalid entries are ignored and counted; key-code collisions fall back to the
+   verified defaults. The guest context source is not yet proven (the inventory state and cursor
+   hit-test are unresolved), so context is never inferred from game state: only a verified caller
+   through push/pop or the explicit diagnostic override moves it. */
+enum {{ PC_INPUT_SCENE, PC_INPUT_DIALOGUE, PC_INPUT_MENU, PC_INPUT_INVENTORY,
+        PC_INPUT_ITEM_PUZZLE, PC_INPUT_CONTEXT_COUNT }};
+enum {{ PC_ACTION_SELECT_PICKAXE, PC_ACTION_SELECT_SLINGSHOT, PC_ACTION_SELECT_CONTEXT_ITEM,
+        PC_ACTION_TOGGLE_INVENTORY, PC_ACTION_POINTER_MOVE, PC_ACTION_POINTER_PRIMARY,
+        PC_ACTION_POINTER_SECONDARY, PC_ACTION_POINTER_SCROLL, PC_ACTION_POINTER_DRAG,
+        PC_ACTION_COUNT }};
+typedef uint32_t (*pc_input_hook)(int context, int action, int32_t x, int32_t y, int32_t detail);
+
+#define PC_INPUT_CONTEXT_MAX 4
+#define PC_INPUT_PENDING 32
+#define PC_INPUT_ENV "ISLAND_PC_INPUT"
+
+static const char *const pc_input_context_names[PC_INPUT_CONTEXT_COUNT] = {{
+    "scene", "dialogue", "menu", "inventory", "item"
+}};
+
+/* Every value here either names an original phone key code or gates a PC-only convenience. */
+struct pc_input_config {{
+    uint32_t ok_key, back_key, items_key; /* original EScancode values */
+    int32_t drag_px;
+    int pointer_confirm, right_button_back, tab_items;
+    int q_select, e_select, f_context;
+    uint32_t tab_scancode, q_scancode, e_scancode, f_scancode;
+    int initial_context;
+}};
+static struct pc_input_config pc_cfg = {{
+    0xa7, 0xa5, 0xa4, /* OK / right softkey / left softkey, verified for the first level */
+    4, 1, 1, 1, 1, 1, 1,
+    SDL_SCANCODE_TAB, SDL_SCANCODE_Q, SDL_SCANCODE_E, SDL_SCANCODE_F,
+    PC_INPUT_SCENE
+}};
+
+static pc_input_hook pc_input_hooks[PC_INPUT_CONTEXT_COUNT][PC_ACTION_COUNT];
+static int pc_input_stack[PC_INPUT_CONTEXT_MAX] = {{ PC_INPUT_SCENE }};
+static unsigned pc_input_depth = 1;
+static int pc_input_configured;
+static int32_t pc_pointer_x, pc_pointer_y, pc_pointer_press_x, pc_pointer_press_y;
+static int pc_pointer_down, pc_pointer_dragged, pc_pointer_right_down;
+static uint32_t pc_pointer_right_scan; /* code latched on press; released whatever the context */
+static struct pc_pending_key {{ uint32_t scan, type; unsigned char host; }} pc_pending_keys[PC_INPUT_PENDING];
+static unsigned pc_pending_count;
+static uint32_t pc_held_keys[PC_INPUT_PENDING];
+static unsigned pc_held_key_count;
+
+static int pc_queue_key(uint32_t scan, uint32_t type, int host) {{
+    if (!scan || pc_pending_count >= PC_INPUT_PENDING) return 0;
+    pc_pending_keys[pc_pending_count].scan = scan;
+    pc_pending_keys[pc_pending_count].type = type;
+    pc_pending_keys[pc_pending_count].host = (unsigned char)(host != 0);
+    pc_pending_count++;
+    return 1;
+}}
+
+/* A release must not be lost to a queue full of synthetic taps: drop the oldest tap for room. */
+static int pc_queue_key_force(uint32_t scan, uint32_t type) {{
+    if (!scan) return 0;
+    if (pc_pending_count >= PC_INPUT_PENDING) {{
+        unsigned victim = 0;
+        for (unsigned i = 0; i < pc_pending_count; i++)
+            if (pc_pending_keys[i].host) {{ victim = i; break; }}
+        memmove(&pc_pending_keys[victim], &pc_pending_keys[victim + 1],
+                (pc_pending_count - victim - 1) * sizeof pc_pending_keys[0]);
+        pc_pending_count--;
+    }}
+    return pc_queue_key(scan, type, 0);
+}}
+
+/* A synthetic confirm/cancel is only useful as a matched down/up pair, and one still in flight
+   must not be queued twice (a duplicate click before the guest update is one activation). */
+static int pc_queue_tap(uint32_t scan) {{
+    if (!scan || pc_pending_count + 2 > PC_INPUT_PENDING) return 0;
+    for (unsigned i = 0; i + 1 < pc_pending_count; i++)
+        if (pc_pending_keys[i].scan == scan && pc_pending_keys[i].type == 3 &&
+            pc_pending_keys[i + 1].scan == scan && pc_pending_keys[i + 1].type == 2) return 0;
+    return pc_queue_key(scan, 3, 1) && pc_queue_key(scan, 2, 1);
+}}
+
+static int pc_key_held(uint32_t scan) {{
+    for (unsigned i = 0; i < pc_held_key_count; i++)
+        if (pc_held_keys[i] == scan) return 1;
+    return 0;
+}}
+
+/* Returns 0 for a duplicate key-down, which is not forwarded (event dedupe). */
+static int pc_note_key(uint32_t scan, uint32_t type) {{
+    if (type == 3) {{
+        if (pc_key_held(scan)) return 0;
+        if (pc_held_key_count < PC_INPUT_PENDING) pc_held_keys[pc_held_key_count++] = scan;
+        return 1;
+    }}
+    for (unsigned i = 0; i < pc_held_key_count; i++)
+        if (pc_held_keys[i] == scan) {{
+            pc_held_keys[i] = pc_held_keys[--pc_held_key_count];
+            break;
+        }}
+    return 1;
+}}
+
+/* Queue releases for every physical key still down, so crossing a UI boundary cannot latch a
+   movement/confirm key in the next context. */
+static void pc_release_held_keys(void) {{
+    while (pc_held_key_count) {{
+        uint32_t scan = pc_held_keys[--pc_held_key_count];
+        if (!pc_queue_key_force(scan, 2)) break;
+    }}
+    pc_held_key_count = 0;
+}}
+
+static void pc_release_pointer_latch(void) {{
+    if (pc_pointer_right_down) {{
+        pc_pointer_right_down = 0;
+        (void)pc_queue_key_force(pc_pointer_right_scan, 2);
+    }}
+    pc_pointer_right_scan = 0;
+    pc_pointer_down = 0;
+    pc_pointer_dragged = 0;
+}}
+
+/* A context transition or focus loss cancels host activations not yet delivered: a click aimed
+   at the scene must not arrive after an inventory/menu takes the input, and Alt+Tab must not
+   leave a queued confirm behind. Physical releases are kept. */
+static void pc_drop_pending_taps(void) {{
+    unsigned keep = 0;
+    for (unsigned i = 0; i < pc_pending_count; i++)
+        if (!pc_pending_keys[i].host) pc_pending_keys[keep++] = pc_pending_keys[i];
+    pc_pending_count = keep;
+}}
+
+/* Only context transitions and focus loss need this; they are rare, so the log stays readable. */
+static void pc_input_isolate(void) {{
+    pc_drop_pending_taps();
+    pc_release_held_keys();
+    pc_release_pointer_latch();
+}}
+
+static int pc_input_top(void) {{ return pc_input_stack[pc_input_depth ? pc_input_depth - 1 : 0]; }}
+
+static int pc_input_set_context(int context) {{
+    if (context < 0 || context >= PC_INPUT_CONTEXT_COUNT) return pc_input_top();
+    int previous = pc_input_top();
+    if (context == previous) return previous;
+    pc_input_isolate();
+    pc_input_stack[pc_input_depth - 1] = context;
+    fprintf(stderr, "pc-input: context %s -> %s\\n",
+            pc_input_context_names[previous], pc_input_context_names[context]);
+    return previous;
+}}
+
+static int pc_input_push_context(int context) {{
+    if (context < 0 || context >= PC_INPUT_CONTEXT_COUNT) return pc_input_top();
+    if (context == pc_input_top()) return context;
+    if (pc_input_depth >= PC_INPUT_CONTEXT_MAX) {{
+        fputs("pc-input: context stack full; push ignored\\n", stderr);
+        return pc_input_top();
+    }}
+    pc_input_isolate();
+    pc_input_stack[pc_input_depth++] = context;
+    fprintf(stderr, "pc-input: context push %s\\n", pc_input_context_names[context]);
+    return context;
+}}
+
+static int pc_input_pop_context(void) {{
+    if (pc_input_depth <= 1) return pc_input_top();
+    pc_input_isolate();
+    int context = pc_input_stack[--pc_input_depth];
+    fprintf(stderr, "pc-input: context pop %s -> %s\\n",
+            pc_input_context_names[context], pc_input_context_names[pc_input_top()]);
+    return pc_input_top();
+}}
+
+static int pc_parse_bool(const char *text, int *out) {{
+    if (!strcmp(text, "1") || !strcmp(text, "on") || !strcmp(text, "yes") || !strcmp(text, "true")) {{
+        *out = 1;
+        return 1;
+    }}
+    if (!strcmp(text, "0") || !strcmp(text, "off") || !strcmp(text, "no") || !strcmp(text, "false")) {{
+        *out = 0;
+        return 1;
+    }}
+    return 0;
+}}
+
+static int pc_parse_u32(const char *text, uint32_t *out) {{
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 0);
+    if (end == text || *end || errno || !value || (uint64_t)value > UINT32_MAX) return 0;
+    *out = (uint32_t)value;
+    return 1;
+}}
+
+static int pc_parse_scancode(const char *text, uint32_t *out) {{
+    uint32_t value;
+    if (!pc_parse_u32(text, &value) || value >= (uint32_t)SDL_NUM_SCANCODES) return 0;
+    *out = value;
+    return 1;
+}}
+
+static int pc_parse_context(const char *text, int *out) {{
+    for (int i = 0; i < PC_INPUT_CONTEXT_COUNT; i++)
+        if (!strcmp(text, pc_input_context_names[i])) {{
+            *out = i;
+            return 1;
+        }}
+    if (text[0] >= '0' && text[0] <= '9' && !text[1]) {{
+        int value = text[0] - '0';
+        if (value < PC_INPUT_CONTEXT_COUNT) {{
+            *out = value;
+            return 1;
+        }}
+    }}
+    return 0;
+}}
+
+/* A PC action must not shadow a key that already carries a verified phone meaning. */
+static int pc_scancode_reserved(uint32_t scancode) {{
+    switch (scancode) {{
+    case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_ESCAPE:
+    case SDL_SCANCODE_SPACE: case SDL_SCANCODE_RSHIFT:
+    case SDL_SCANCODE_LEFT: case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_UP: case SDL_SCANCODE_DOWN:
+    case SDL_SCANCODE_KP_1: case SDL_SCANCODE_KP_2: case SDL_SCANCODE_KP_3:
+    case SDL_SCANCODE_KP_4: case SDL_SCANCODE_KP_5: case SDL_SCANCODE_KP_6:
+    case SDL_SCANCODE_KP_7: case SDL_SCANCODE_KP_8: case SDL_SCANCODE_KP_9:
+    case SDL_SCANCODE_PAGEUP: case SDL_SCANCODE_PAGEDOWN:
+        return 1;
+    default:
+        return 0;
+    }}
+}}
+
+/* Apply ISLAND_PC_INPUT once. Bad input falls back to the verified defaults and is reported but
+   never fatal, so a typo cannot prevent startup. */
+static void pc_input_configure(void) {{
+    const char *spec = getenv(PC_INPUT_ENV);
+    unsigned applied = 0, rejected = 0;
+    if (spec && *spec) {{
+        char copy[256];
+        size_t length = strlen(spec);
+        if (length >= sizeof copy) {{
+            length = sizeof copy - 1;
+            rejected++;
+        }}
+        memcpy(copy, spec, length);
+        copy[length] = 0;
+        for (char *token = strtok(copy, ",; \\t\\r\\n"); token; token = strtok(NULL, ",; \\t\\r\\n")) {{
+            char *equals = strchr(token, '=');
+            if (!equals) {{
+                rejected++;
+                continue;
+            }}
+            *equals = 0;
+            const char *key = token, *value = equals + 1;
+            uint32_t code;
+            int ok = 0;
+            if (!strcmp(key, "ok")) {{
+                ok = pc_parse_u32(value, &code);
+                if (ok) pc_cfg.ok_key = code;
+            }} else if (!strcmp(key, "back")) {{
+                ok = pc_parse_u32(value, &code);
+                if (ok) pc_cfg.back_key = code;
+            }} else if (!strcmp(key, "items")) {{
+                ok = pc_parse_u32(value, &code);
+                if (ok) pc_cfg.items_key = code;
+            }} else if (!strcmp(key, "drag")) {{
+                ok = pc_parse_u32(value, &code) && code <= 64;
+                if (ok) pc_cfg.drag_px = (int32_t)code;
+            }} else if (!strcmp(key, "pointer")) {{
+                ok = pc_parse_bool(value, &pc_cfg.pointer_confirm);
+            }} else if (!strcmp(key, "right")) {{
+                ok = pc_parse_bool(value, &pc_cfg.right_button_back);
+            }} else if (!strcmp(key, "tab")) {{
+                ok = pc_parse_bool(value, &pc_cfg.tab_items);
+            }} else if (!strcmp(key, "q")) {{
+                ok = pc_parse_bool(value, &pc_cfg.q_select);
+            }} else if (!strcmp(key, "e")) {{
+                ok = pc_parse_bool(value, &pc_cfg.e_select);
+            }} else if (!strcmp(key, "f")) {{
+                ok = pc_parse_bool(value, &pc_cfg.f_context);
+            }} else if (!strcmp(key, "tabkey")) {{
+                ok = pc_parse_scancode(value, &pc_cfg.tab_scancode);
+            }} else if (!strcmp(key, "qkey")) {{
+                ok = pc_parse_scancode(value, &pc_cfg.q_scancode);
+            }} else if (!strcmp(key, "ekey")) {{
+                ok = pc_parse_scancode(value, &pc_cfg.e_scancode);
+            }} else if (!strcmp(key, "fkey")) {{
+                ok = pc_parse_scancode(value, &pc_cfg.f_scancode);
+            }} else if (!strcmp(key, "context")) {{
+                ok = pc_parse_context(value, &pc_cfg.initial_context);
+            }}
+            if (ok) applied++;
+            else rejected++;
+        }}
+    }}
+    if (pc_cfg.ok_key == pc_cfg.back_key || pc_cfg.ok_key == pc_cfg.items_key ||
+        pc_cfg.back_key == pc_cfg.items_key) {{
+        fputs("pc-input: softkey codes collide; restoring 0xa7/0xa5/0xa4\\n", stderr);
+        pc_cfg.ok_key = 0xa7;
+        pc_cfg.back_key = 0xa5;
+        pc_cfg.items_key = 0xa4;
+        rejected++;
+    }}
+    if (pc_cfg.tab_scancode == pc_cfg.q_scancode || pc_cfg.tab_scancode == pc_cfg.e_scancode ||
+        pc_cfg.tab_scancode == pc_cfg.f_scancode || pc_cfg.q_scancode == pc_cfg.e_scancode ||
+        pc_cfg.q_scancode == pc_cfg.f_scancode || pc_cfg.e_scancode == pc_cfg.f_scancode ||
+        pc_scancode_reserved(pc_cfg.tab_scancode) || pc_scancode_reserved(pc_cfg.q_scancode) ||
+        pc_scancode_reserved(pc_cfg.e_scancode) || pc_scancode_reserved(pc_cfg.f_scancode)) {{
+        fputs("pc-input: action scancodes collide or shadow a phone key; restoring Tab/Q/E/F\\n", stderr);
+        pc_cfg.tab_scancode = SDL_SCANCODE_TAB;
+        pc_cfg.q_scancode = SDL_SCANCODE_Q;
+        pc_cfg.e_scancode = SDL_SCANCODE_E;
+        pc_cfg.f_scancode = SDL_SCANCODE_F;
+        rejected++;
+    }}
+    (void)pc_input_set_context(pc_cfg.initial_context);
+    fprintf(stderr, "pc-input: ready ok=0x%02x back=0x%02x items=0x%02x drag=%dpx "
+            "pointer=%d right=%d tab=%d select=%d%d%d scancodes=%u/%u/%u/%u context=%s "
+            "entries=%u rejected=%u source=%s\\n",
+            (unsigned)pc_cfg.ok_key, (unsigned)pc_cfg.back_key, (unsigned)pc_cfg.items_key,
+            (int)pc_cfg.drag_px, pc_cfg.pointer_confirm, pc_cfg.right_button_back, pc_cfg.tab_items,
+            pc_cfg.q_select, pc_cfg.e_select, pc_cfg.f_context,
+            (unsigned)pc_cfg.tab_scancode, (unsigned)pc_cfg.q_scancode,
+            (unsigned)pc_cfg.e_scancode, (unsigned)pc_cfg.f_scancode,
+            pc_input_context_names[pc_input_top()], applied, rejected,
+            (spec && *spec) ? "env" : "default");
+    pc_input_configured = 1;
+}}
+
+static void pc_input_install_hook(int context, int action, pc_input_hook hook) {{
+    if (context >= 0 && context < PC_INPUT_CONTEXT_COUNT && action >= 0 && action < PC_ACTION_COUNT)
+        pc_input_hooks[context][action] = hook;
+}}
+
+/* Default routes are the original key codes accepted for this build, scoped per context so a UI
+   cannot fall through to a scene-only action (notably Tab opening inventory from inside a UI).
+   Anything without a verified code (item selection, pointer move/scroll/drag) returns 0 unless a
+   hook installed for that exact context supplies one. */
+static uint32_t pc_input_default_route(int context, int action) {{
+    switch (action) {{
+    case PC_ACTION_TOGGLE_INVENTORY:
+        return context == PC_INPUT_SCENE && pc_cfg.tab_items ? pc_cfg.items_key : 0;
+    case PC_ACTION_POINTER_PRIMARY:
+        return pc_cfg.pointer_confirm ? pc_cfg.ok_key : 0;
+    case PC_ACTION_POINTER_SECONDARY:
+        return pc_cfg.right_button_back ? pc_cfg.back_key : 0;
+    default:
+        return 0;
+    }}
+}}
+
+static uint32_t pc_input_route(int action, int32_t x, int32_t y, int32_t detail) {{
+    if (action < 0 || action >= PC_ACTION_COUNT) return 0;
+    int context = pc_input_top();
+    pc_input_hook hook = pc_input_hooks[context][action];
+    if (hook) return hook(context, action, x, y, detail);
+    return pc_input_default_route(context, action);
+}}
+
+static int pc_send_key(uint32_t *stack, uint32_t sp, uint32_t scan, uint32_t type) {{
+    uint32_t key_event = sp - 16;
+    guest_write(stack, key_event, 0); /* iCode is only set for EEventKey, which the game ignores. */
+    guest_write(stack, key_event + 4, scan);
+    guest_write(stack, key_event + 8, 0);  /* iModifiers */
+    guest_write(stack, key_event + 12, 0); /* iRepeats */
+    struct guest_thread nested = {{0}};
+    nested.target = guest_read(stack, guest_read(stack, framework.control) + 0x0c);
+    nested.r[0] = framework.control;
+    nested.r[1] = key_event;
+    nested.r[2] = type; /* EEventKeyDown/Up */
+    nested.r[13] = key_event;
+    nested.r[14] = GUEST_THREAD_SENTINEL;
+    return guest_run(&nested, stack);
+}}
+
+/* Map a window-pixel pointer position into the 176x208 logical frame. The game window owns only
+   the frame lease here; no pointer coordinates are written into guest memory. */
+static void pc_logical_point(uint32_t window_id, int wx, int wy, int32_t *x, int32_t *y) {{
+    int ww = window_width, wh = window_height;
+    SDL_Window *window = SDL_GetWindowFromID(window_id);
+    if (window) SDL_GetWindowSize(window, &ww, &wh);
+    if (ww <= 0) ww = window_width;
+    if (wh <= 0) wh = window_height;
+    int32_t lx = (int32_t)((int64_t)wx * window_width / ww);
+    int32_t ly = (int32_t)((int64_t)wy * window_height / wh);
+    *x = lx < 0 ? 0 : lx >= window_width ? window_width - 1 : lx;
+    *y = ly < 0 ? 0 : ly >= window_height ? window_height - 1 : ly;
+}}
+
+/* Deliver one SDL transition per scheduler pass so a short tap reaches the guest update. Only
+   matching down/up pairs are ever injected: physical keys keep their held state, synthetic taps
+   are queued as a pair, and a latched pointer button releases the exact code it pressed. */
 static int pump_window_input(uint32_t *stack, uint32_t sp) {{
     if (!framework.control || !SDL_WasInit(SDL_INIT_VIDEO)) return 0;
+    if (!pc_input_configured) pc_input_configure();
+
+    /* Host-generated transitions (a click becomes an OK tap, Tab becomes the items softkey) are
+       delivered one per scheduler pass, like physical key transitions. */
+    if (pc_pending_count) {{
+        struct pc_pending_key pending = pc_pending_keys[0];
+        memmove(&pc_pending_keys[0], &pc_pending_keys[1],
+                (pc_pending_count - 1) * sizeof pc_pending_keys[0]);
+        pc_pending_count--;
+        return pc_send_key(stack, sp, pending.scan, pending.type);
+    }}
+
     SDL_Event event;
     SDL_PumpEvents();
     int queued;
     while ((queued = SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT)) > 0) {{
         if (event.type == SDL_QUIT) return -1;
+        if (event.type == SDL_WINDOWEVENT) {{
+            /* Lost focus or a minimize must not leave a movement, confirm or pointer button
+               latched; the releases are queued for the next scheduler pass. */
+            if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
+                event.window.event == SDL_WINDOWEVENT_MINIMIZED) {{
+                pc_input_isolate();
+            }}
+            continue;
+        }}
+        if (event.type == SDL_MOUSEMOTION) {{
+            int32_t x, y;
+            pc_logical_point(event.motion.windowID, event.motion.x, event.motion.y, &x, &y);
+            pc_pointer_x = x;
+            pc_pointer_y = y;
+            if (pc_pointer_down) {{
+                int32_t dx = x - pc_pointer_press_x, dy = y - pc_pointer_press_y;
+                if (dx > pc_cfg.drag_px || dx < -pc_cfg.drag_px ||
+                    dy > pc_cfg.drag_px || dy < -pc_cfg.drag_px) pc_pointer_dragged = 1;
+            }}
+            /* Cursor positioning has no verified guest field or hit-test; the hook decides. */
+            (void)pc_input_route(PC_ACTION_POINTER_MOVE, x, y, 0);
+            continue;
+        }}
+        if (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {{
+            int32_t x, y;
+            pc_logical_point(event.button.windowID, event.button.x, event.button.y, &x, &y);
+            pc_pointer_x = x;
+            pc_pointer_y = y;
+            if (event.button.button == SDL_BUTTON_LEFT) {{
+                if (event.type == SDL_MOUSEBUTTONDOWN) {{
+                    if (pc_pointer_down) continue; /* duplicate press: already tracked */
+                    pc_pointer_down = 1;
+                    pc_pointer_dragged = 0;
+                    pc_pointer_press_x = x;
+                    pc_pointer_press_y = y;
+                }} else if (pc_pointer_down) {{
+                    int32_t dx = x - pc_pointer_press_x, dy = y - pc_pointer_press_y;
+                    int dragged = pc_pointer_dragged ||
+                        dx > pc_cfg.drag_px || dx < -pc_cfg.drag_px ||
+                        dy > pc_cfg.drag_px || dy < -pc_cfg.drag_px;
+                    pc_pointer_down = 0;
+                    pc_pointer_dragged = 0;
+                    if (dragged) {{
+                        /* Drag/drop needs the original two-slot combine path (unresolved). */
+                        (void)pc_input_route(PC_ACTION_POINTER_DRAG, x, y, 0);
+                    }} else {{
+                        (void)pc_queue_tap(pc_input_route(PC_ACTION_POINTER_PRIMARY, x, y, 0));
+                    }}
+                }}
+                continue;
+            }}
+            if (event.button.button == SDL_BUTTON_RIGHT) {{
+                if (event.type == SDL_MOUSEBUTTONDOWN) {{
+                    /* Latch the code chosen at press time and release exactly that code even if
+                       the input context changed while the button was held. */
+                    if (!pc_pointer_right_down) {{
+                        uint32_t scan = pc_input_route(PC_ACTION_POINTER_SECONDARY, x, y, 0);
+                        if (scan && pc_queue_key_force(scan, 3)) {{
+                            pc_pointer_right_down = 1;
+                            pc_pointer_right_scan = scan;
+                        }}
+                    }}
+                }} else if (pc_pointer_right_down) {{
+                    pc_pointer_right_down = 0;
+                    (void)pc_queue_key_force(pc_pointer_right_scan, 2);
+                    pc_pointer_right_scan = 0;
+                }}
+                continue;
+            }}
+            continue;
+        }}
+        if (event.type == SDL_MOUSEWHEEL) {{
+            /* No original list-scroll input is proven; the hook decides once one is. */
+            if (event.wheel.y)
+                (void)pc_input_route(PC_ACTION_POINTER_SCROLL, pc_pointer_x, pc_pointer_y, event.wheel.y);
+            continue;
+        }}
         if ((event.type != SDL_KEYDOWN && event.type != SDL_KEYUP) || event.key.repeat) continue;
+
+        /* PC-only actions never fall through to the phone key table. Their scancodes are
+           configurable; collisions and shadows were rejected when the layer was configured. */
+        uint32_t scancode = (uint32_t)event.key.keysym.scancode;
+        int action = -1;
+        if (scancode == pc_cfg.q_scancode && pc_cfg.q_select) action = PC_ACTION_SELECT_PICKAXE;
+        else if (scancode == pc_cfg.e_scancode && pc_cfg.e_select) action = PC_ACTION_SELECT_SLINGSHOT;
+        else if (scancode == pc_cfg.f_scancode && pc_cfg.f_context) action = PC_ACTION_SELECT_CONTEXT_ITEM;
+        else if (scancode == pc_cfg.tab_scancode && pc_cfg.tab_items) action = PC_ACTION_TOGGLE_INVENTORY;
+        if (scancode == pc_cfg.q_scancode || scancode == pc_cfg.e_scancode ||
+            scancode == pc_cfg.f_scancode || scancode == pc_cfg.tab_scancode) {{
+            /* A disabled action stays swallowed rather than becoming a phone key. */
+            if (event.type == SDL_KEYDOWN && action >= 0)
+                (void)pc_queue_tap(pc_input_route(action, pc_pointer_x, pc_pointer_y, 0));
+            continue;
+        }}
+
         uint32_t scan;
         /* Physical keypad positions retain their phone mapping with Num Lock off. */
-        switch (event.key.keysym.scancode) {{
-        case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: scan = 0xa4; break; /* left softkey */
-        case SDL_SCANCODE_ESCAPE: scan = 0xa5; break; /* right softkey */
-        case SDL_SCANCODE_RSHIFT: scan = 0xa7; break; /* D-Pad center / OK */
+        switch (scancode) {{
+        case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: scan = pc_cfg.items_key; break; /* left softkey */
+        case SDL_SCANCODE_ESCAPE: scan = pc_cfg.back_key; break; /* right softkey */
+        case SDL_SCANCODE_SPACE: case SDL_SCANCODE_RSHIFT: scan = pc_cfg.ok_key; break; /* D-Pad center / OK */
         case SDL_SCANCODE_LEFT:   scan = 0x0e; break;
         case SDL_SCANCODE_RIGHT:  scan = 0x0f; break;
         case SDL_SCANCODE_UP:     scan = 0x10; break;
@@ -2237,19 +2833,9 @@ static int pump_window_input(uint32_t *stack, uint32_t sp) {{
         case SDL_SCANCODE_PAGEDOWN: scan = 0x85; break; /* * */
         default: continue;
         }}
-        uint32_t key_event = sp - 16;
-        guest_write(stack, key_event, 0); /* iCode is only set for EEventKey, which the game ignores. */
-        guest_write(stack, key_event + 4, scan);
-        guest_write(stack, key_event + 8, 0);  /* iModifiers */
-        guest_write(stack, key_event + 12, 0); /* iRepeats */
-        struct guest_thread nested = {{0}};
-        nested.target = guest_read(stack, guest_read(stack, framework.control) + 0x0c);
-        nested.r[0] = framework.control;
-        nested.r[1] = key_event;
-        nested.r[2] = event.type == SDL_KEYDOWN ? 3 : 2; /* EEventKeyDown/Up */
-        nested.r[13] = key_event;
-        nested.r[14] = GUEST_THREAD_SENTINEL;
-        return guest_run(&nested, stack);
+        uint32_t type = event.type == SDL_KEYDOWN ? 3 : 2; /* EEventKeyDown/Up */
+        if (!pc_note_key(scan, type)) continue; /* duplicate down: already delivered */
+        return pc_send_key(stack, sp, scan, type);
     }}
     if (queued < 0) {{ fprintf(stderr, "SDL keyboard events: %s\\n", SDL_GetError()); return 3; }}
     return 0;
@@ -2271,6 +2857,7 @@ static int cleanup_pop_and_destroy(uint32_t *stack, uint32_t count, uint32_t sp)
             !run_nested_event(stack, guest_read(stack, guest_read(stack, pointer) + 4), pointer, sp)) return 0;
         if (kind == CLEANUP_ITEM && !run_nested_event(stack, operation, pointer, sp)) return 0;
         if (kind == CLEANUP_READ_STREAM) read_stream_release(stack, pointer);
+        if (kind == CLEANUP_WRITE_STREAM) write_stream_release(stack, pointer, 0);
     }}
     return 1;
 }}
@@ -2315,6 +2902,30 @@ static int remove_active(uint32_t *stack, uint32_t object) {{
     guest_write(stack, link, 0);
     guest_write(stack, link + 4, 0);
     return 1;
+}}
+
+/* Host CPeriodic DoCancel: CTimer::DoCancel() calls RTimer::Cancel(), which completes an outstanding
+   request with KErrCancel and leaves none for User::WaitForRequest after CActive::Cancel(). */
+static int periodic_cancel(uint32_t *stack, uint32_t object) {{
+    uint32_t id = guest_read(stack, object + 28), status = object + 4;
+    if (!id || id > framework.next_timer) return 1;
+    if (timers[id - 1].status == status) {{
+        timers[id - 1].status = 0;
+        guest_write(stack, status, (uint32_t)-3);
+        guest_write(stack, status + 4, guest_read(stack, status + 4) & ~2u);
+    }}
+    if (timers[id - 1].periodic == object) timers[id - 1].periodic = 0;
+    return 1;
+}}
+
+/* Host CPeriodic destructor: cancel the timer (as CTimer does), then leave the scheduler queue. */
+static int periodic_destroy(uint32_t *stack, uint32_t object) {{
+    uint32_t flags = guest_read(stack, object + 8);
+    if (flags & 1) {{
+        if (!periodic_cancel(stack, object)) return 0;
+        guest_write(stack, object + 8, flags & ~3u);
+    }}
+    return remove_active(stack, object);
 }}
 
 static int worker_scheduler_construct(uint32_t *stack, uint32_t object) {{
@@ -2513,6 +3124,7 @@ static int guest_run(struct guest_thread *ctx, uint32_t *stack) {{
     (void)guest_write_small;
     (void)guest_read64;
     (void)home_time;
+    (void)time_date_time;
     (void)start_application;
     (void)construct_eik_application;
     (void)finish_factory;
@@ -2606,6 +3218,7 @@ int main(int argc, char **argv) {{
     (void)guest_write_small;
     (void)guest_read64;
     (void)home_time;
+    (void)time_date_time;
     (void)start_application;
     (void)construct_eik_application;
     (void)finish_factory;

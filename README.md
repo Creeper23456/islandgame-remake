@@ -6,10 +6,10 @@
 
 ## 在 Linux 上构建和运行
 
-使用 Python 3、Clang 19、`pkg-config`、`unzip`、SDL2、FreeType、Fontconfig、zlib 和中文字体。Debian 13 可安装：
+使用 Python 3、Clang 19、`pkg-config`、`unzip`、SDL2、Vulkan、FreeType、Fontconfig、zlib 和中文字体。Debian 13 可安装：
 
 ```sh
-sudo apt install python3 clang-19 pkg-config unzip libsdl2-dev libfreetype-dev libfontconfig1-dev zlib1g-dev fonts-noto-cjk
+sudo apt install python3 clang-19 pkg-config unzip libsdl2-dev libvulkan-dev libfreetype-dev libfontconfig1-dev zlib1g-dev fonts-noto-cjk
 ```
 
 把自己持有的原版 `Lament-Island.zip` 放在仓库根目录。从根目录运行以下命令；`mktemp` 为本轮构建和游玩创建独立目录，不覆盖旧测试盘：
@@ -21,7 +21,7 @@ python3 tools/extract_e32.py Lament-Island.zip "$run/e32" --resource-root "$run/
 unzip -q Lament-Island.zip 'Lament-Island/SIMLIFE/*' -d "$run/original"
 python3 tools/recomp_start.py --game-dlls "$run/e32" "$run/e32/IsLand_3rd.exe" "$run/island.c"
 clang-19 -std=c11 -O2 -Wall -Wextra -Werror -Wno-unused-function \
-  "$run/island.c" $(pkg-config --cflags --libs sdl2 freetype2 fontconfig zlib) -lm -o "$run/island"
+  "$run/island.c" $(pkg-config --cflags --libs sdl2 freetype2 fontconfig zlib vulkan) -lm -o "$run/island"
 printf '测试目录：%s\n' "$run"
 "$run/island" "$run/drive" "$run/original/Lament-Island/SIMLIFE" 2>"$run/runtime.log"
 ```
@@ -31,5 +31,6 @@ printf '测试目录：%s\n' "$run"
 ## 文档与许可
 
 - [序章手动验收与键位](docs/first-level.md)
+- [PC 版现代化需求](docs/pc-modernization.md)
 - [移植架构与诊断](docs/runtime.md)
 - 项目源码采用 [GPL-3.0](LICENSE)。原游戏包、素材、提取与翻译产物、存档和日志不在仓库许可或分发范围内。
